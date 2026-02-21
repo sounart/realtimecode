@@ -3,7 +3,8 @@ export type StreamEvent =
   | ToolCallEvent
   | FileChangeEvent
   | StatusEvent
-  | ErrorEvent;
+  | ErrorEvent
+  | TranscriptEvent;
 
 export type StdoutEvent = {
   type: 'stdout';
@@ -40,5 +41,12 @@ export type ErrorEvent = {
   message: string;
   code?: string;
   recoverable: boolean;
+  timestamp: string;
+};
+
+export type TranscriptEvent = {
+  type: 'transcript';
+  text: string;
+  isFinal: boolean;
   timestamp: string;
 };

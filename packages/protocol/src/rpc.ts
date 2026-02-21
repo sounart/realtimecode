@@ -10,7 +10,9 @@ export type JsonRpcRequest = {
     | 'session.status'
     | 'session.stop'
     | 'instruction.submit'
-    | 'instruction.cancel';
+    | 'instruction.cancel'
+    | 'audio.stream'
+    | 'audio.commit';
   params: unknown;
 };
 

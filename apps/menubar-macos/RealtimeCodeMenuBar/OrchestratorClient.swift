@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Errors from the orchestrator IPC connection.
@@ -6,6 +7,7 @@ enum OrchestratorError: Error, LocalizedError {
     case notConnected
     case sendFailed(String)
     case invalidResponse(String)
+    case requestTimeout(String)
 
     var errorDescription: String? {
         switch self {
@@ -13,6 +15,7 @@ enum OrchestratorError: Error, LocalizedError {
         case .notConnected: return "Not connected to orchestrator"
         case .sendFailed(let msg): return "Send failed: \(msg)"
         case .invalidResponse(let msg): return "Invalid response: \(msg)"
+        case .requestTimeout(let msg): return "Request timeout: \(msg)"
         }
     }
 }
@@ -22,6 +25,7 @@ enum OrchestratorEvent {
     case status(state: String, sessionId: String)
     case transcript(text: String, isFinal: Bool)
     case error(message: String, recoverable: Bool)
+    case stdout(instructionId: String, chunk: String)
 }
 
 /// IPC client for the orchestrator daemon via Unix domain socket.
@@ -34,13 +38,29 @@ final class OrchestratorClient {
     private var nextRequestId: Int = 1
     private let queue = DispatchQueue(label: "com.realtimecode.orchestrator-client")
 
+    /// Pending request callbacks keyed by request id, with their timeout timers.
+    private var pendingRequests: [Int: (callback: ([String: Any]?) -> Void, timer: DispatchSourceTimer)] = [:]
+
+    /// Default timeout for JSON-RPC requests (seconds).
+    var requestTimeout: TimeInterval = 10.0
+
     private(set) var isConnected = false
+
+    /// Whether the client should automatically retry connection on failure/disconnect.
+    private var autoReconnect = false
+    private var reconnectTimer: DispatchSourceTimer?
+    private var reconnectAttempt = 0
+    private static let maxReconnectDelay: TimeInterval = 30.0
+    private static let initialReconnectDelay: TimeInterval = 1.0
 
     /// Called on the main queue when an event is received from the orchestrator.
     var onEvent: ((OrchestratorEvent) -> Void)?
 
     /// Called on the main queue when the connection is lost.
     var onDisconnect: (() -> Void)?
+
+    /// Called on the main queue when the connection is established.
+    var onConnect: (() -> Void)?
 
     init(socketPath: String? = nil) {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -63,7 +83,7 @@ final class OrchestratorClient {
         addr.sun_family = sa_family_t(AF_UNIX)
         let pathBytes = socketPath.utf8CString
         guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else {
-            close(socketFd)
+            Darwin.close(socketFd)
             socketFd = -1
             throw OrchestratorError.connectionFailed("Socket path too long")
         }
@@ -83,7 +103,7 @@ final class OrchestratorClient {
 
         guard connectResult == 0 else {
             let errMsg = String(cString: strerror(errno))
-            close(socketFd)
+            Darwin.close(socketFd)
             socketFd = -1
             throw OrchestratorError.connectionFailed(errMsg)
         }
@@ -93,33 +113,41 @@ final class OrchestratorClient {
         _ = fcntl(socketFd, F_SETFL, flags | O_NONBLOCK)
 
         isConnected = true
+        reconnectAttempt = 0
         startReading()
+
+        DispatchQueue.main.async { [weak self] in
+            self?.onConnect?()
+        }
     }
 
     func disconnect() {
-        guard isConnected else { return }
-        readSource?.cancel()
-        readSource = nil
-        close(socketFd)
-        socketFd = -1
-        isConnected = false
-        readBuffer = Data()
+        autoReconnect = false
+        cancelReconnectTimer()
+        performDisconnect()
+    }
+
+    /// Connect with automatic retry using exponential backoff.
+    /// Retries at 1s, 2s, 4s, 8s, 16s, 30s intervals until connected.
+    func connectWithRetry() {
+        autoReconnect = true
+        attemptConnection()
     }
 
     // MARK: - JSON-RPC Methods
 
     /// Start an orchestrator session for the given working directory.
-    func sessionStart(workdir: String, profile: String = "default") {
+    func sessionStart(workdir: String, profile: String = "default", completion: (([String: Any]?) -> Void)? = nil) {
         let id = nextId()
         let params: [String: Any] = ["workdir": workdir, "profile": profile]
-        sendRequest(id: id, method: "session.start", params: params)
+        sendRequest(id: id, method: "session.start", params: params, completion: completion)
     }
 
     /// Stop the current orchestrator session.
-    func sessionStop(sessionId: String) {
+    func sessionStop(sessionId: String, completion: (([String: Any]?) -> Void)? = nil) {
         let id = nextId()
         let params: [String: Any] = ["sessionId": sessionId]
-        sendRequest(id: id, method: "session.stop", params: params)
+        sendRequest(id: id, method: "session.stop", params: params, completion: completion)
     }
 
     /// Stream an audio chunk (base64-encoded PCM16 24kHz mono).
@@ -151,13 +179,36 @@ final class OrchestratorClient {
         return id
     }
 
-    private func sendRequest(id: Int, method: String, params: [String: Any]) {
+    private func sendRequest(id: Int, method: String, params: [String: Any], completion: (([String: Any]?) -> Void)? = nil) {
         let request: [String: Any] = [
             "jsonrpc": "2.0",
             "id": id,
             "method": method,
             "params": params
         ]
+
+        if let completion = completion {
+            // Set up timeout timer
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.schedule(deadline: .now() + requestTimeout)
+            timer.setEventHandler { [weak self] in
+                guard let self = self else { return }
+                if let pending = self.pendingRequests.removeValue(forKey: id) {
+                    pending.timer.cancel()
+                    DispatchQueue.main.async {
+                        self.onEvent?(.error(
+                            message: "Request '\(method)' timed out after \(Int(self.requestTimeout))s",
+                            recoverable: true
+                        ))
+                        completion(nil)
+                    }
+                }
+            }
+            timer.resume()
+
+            pendingRequests[id] = (callback: completion, timer: timer)
+        }
+
         sendJSON(request)
     }
 
@@ -177,7 +228,7 @@ final class OrchestratorClient {
                 guard let baseAddress = ptr.baseAddress else { return }
                 var sent = 0
                 while sent < lineData.count {
-                    let result = write(self.socketFd, baseAddress + sent, lineData.count - sent)
+                    let result = Darwin.write(self.socketFd, baseAddress + sent, lineData.count - sent)
                     if result <= 0 {
                         DispatchQueue.main.async {
                             self.handleDisconnect()
@@ -197,7 +248,7 @@ final class OrchestratorClient {
             guard let self = self else { return }
 
             var buf = [UInt8](repeating: 0, count: 8192)
-            let bytesRead = read(self.socketFd, &buf, buf.count)
+            let bytesRead = Darwin.read(self.socketFd, &buf, buf.count)
 
             if bytesRead <= 0 {
                 DispatchQueue.main.async { self.handleDisconnect() }
@@ -211,7 +262,7 @@ final class OrchestratorClient {
         source.setCancelHandler { [weak self] in
             guard let self = self else { return }
             if self.socketFd >= 0 {
-                close(self.socketFd)
+                Darwin.close(self.socketFd)
                 self.socketFd = -1
             }
         }
@@ -238,12 +289,20 @@ final class OrchestratorClient {
 
     private func handleMessage(_ json: [String: Any]) {
         // JSON-RPC response (has id)
-        if json["id"] != nil {
-            if let error = json["error"] as? [String: Any],
-               let message = error["message"] as? String {
+        if let id = json["id"] as? Int {
+            if let pending = pendingRequests.removeValue(forKey: id) {
+                pending.timer.cancel()
+                if let error = json["error"] as? [String: Any],
+                   let message = error["message"] as? String {
+                    onEvent?(.error(message: message, recoverable: true))
+                    pending.callback(nil)
+                } else {
+                    pending.callback(json["result"] as? [String: Any])
+                }
+            } else if let error = json["error"] as? [String: Any],
+                      let message = error["message"] as? String {
                 onEvent?(.error(message: message, recoverable: true))
             }
-            // Responses to session.start/stop are acknowledged silently
             return
         }
 
@@ -259,7 +318,7 @@ final class OrchestratorClient {
 
         case "event.transcript":
             let text = params["text"] as? String ?? ""
-            let isFinal = params["final"] as? Bool ?? false
+            let isFinal = params["isFinal"] as? Bool ?? false
             onEvent?(.transcript(text: text, isFinal: isFinal))
 
         case "event.error":
@@ -267,19 +326,75 @@ final class OrchestratorClient {
             let recoverable = params["recoverable"] as? Bool ?? true
             onEvent?(.error(message: message, recoverable: recoverable))
 
+        case "event.stdout":
+            let instructionId = params["instructionId"] as? String ?? ""
+            let chunk = params["chunk"] as? String ?? ""
+            onEvent?(.stdout(instructionId: instructionId, chunk: chunk))
+
         default:
             break
         }
     }
 
-    private func handleDisconnect() {
-        isConnected = false
+    // MARK: - Connection Management
+
+    private func performDisconnect() {
+        guard isConnected else { return }
+        // Cancel all pending requests
+        for (_, pending) in pendingRequests {
+            pending.timer.cancel()
+        }
+        pendingRequests.removeAll()
+
         readSource?.cancel()
         readSource = nil
         if socketFd >= 0 {
-            close(socketFd)
+            Darwin.close(socketFd)
             socketFd = -1
         }
+        isConnected = false
+        readBuffer = Data()
+    }
+
+    private func handleDisconnect() {
+        performDisconnect()
         onDisconnect?()
+
+        if autoReconnect {
+            scheduleReconnect()
+        }
+    }
+
+    private func attemptConnection() {
+        do {
+            try connect()
+        } catch {
+            if autoReconnect {
+                scheduleReconnect()
+            }
+        }
+    }
+
+    private func scheduleReconnect() {
+        cancelReconnectTimer()
+
+        let delay = min(
+            Self.initialReconnectDelay * pow(2.0, Double(reconnectAttempt)),
+            Self.maxReconnectDelay
+        )
+        reconnectAttempt += 1
+
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + delay)
+        timer.setEventHandler { [weak self] in
+            self?.attemptConnection()
+        }
+        timer.resume()
+        reconnectTimer = timer
+    }
+
+    private func cancelReconnectTimer() {
+        reconnectTimer?.cancel()
+        reconnectTimer = nil
     }
 }

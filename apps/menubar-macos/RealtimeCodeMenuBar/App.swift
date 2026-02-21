@@ -18,6 +18,10 @@ final class AppState: ObservableObject {
         setupMicService()
         setupHotkeyManager()
         setupOrchestratorClient()
+
+        // Auto-connect with retry and start hotkey listener
+        orchestratorClient.connectWithRetry()
+        hotkeyManager.startListening()
     }
 
     // MARK: - Setup
@@ -67,7 +71,16 @@ final class AppState: ObservableObject {
                 }
             case .error(let message, _):
                 self.statusText = "Error: \(message)"
+            case .stdout(_, let chunk):
+                if !chunk.isEmpty {
+                    self.statusText = "Executing..."
+                }
             }
+        }
+
+        orchestratorClient.onConnect = { [weak self] in
+            self?.isConnected = true
+            self?.statusText = "Connected"
         }
 
         orchestratorClient.onDisconnect = { [weak self] in
@@ -79,17 +92,15 @@ final class AppState: ObservableObject {
     // MARK: - Actions
 
     func connectToOrchestrator() {
-        do {
-            try orchestratorClient.connect()
-            isConnected = true
-            statusText = "Connected"
-        } catch {
-            statusText = "Connection failed"
-            isConnected = false
-        }
+        orchestratorClient.connectWithRetry()
     }
 
     func startRecording() {
+        guard isConnected else {
+            statusText = "Not connected"
+            return
+        }
+
         micService.requestPermission { [weak self] granted in
             guard let self = self, granted else {
                 self?.statusText = "Mic permission denied"

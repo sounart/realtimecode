@@ -20,7 +20,7 @@ const connectedSockets = new Set<net.Socket>();
 session.onEvent((event: StreamEvent) => {
   const notification = JSON.stringify({
     jsonrpc: '2.0',
-    method: 'event.stream',
+    method: `event.${event.type}`,
     params: event
   });
 
@@ -49,6 +49,22 @@ function parseRequest(line: string): JsonRpcRequest | null {
     return parsed;
   } catch {
     return null;
+  }
+}
+
+function handleNotification(request: JsonRpcRequest): void {
+  switch (request.method) {
+    case 'audio.stream': {
+      const params = request.params as { audio: string };
+      session.appendAudio(params.audio);
+      break;
+    }
+    case 'audio.commit': {
+      session.commitHotkey();
+      break;
+    }
+    default:
+      logger.warn({ method: request.method }, 'unknown notification method');
   }
 }
 
@@ -130,11 +146,17 @@ async function startServer(): Promise<void> {
 
         if (line.length > 0) {
           const request = parseRequest(line);
-          const response = request
-            ? handleRequest(request)
-            : errorResponse(null, -32700, 'Parse error');
 
-          socket.write(`${JSON.stringify(response)}\n`);
+          if (request && request.id == null) {
+            // JSON-RPC notification (no id) — handle without response
+            handleNotification(request);
+          } else {
+            const response = request
+              ? handleRequest(request)
+              : errorResponse(null, -32700, 'Parse error');
+
+            socket.write(`${JSON.stringify(response)}\n`);
+          }
         }
 
         newline = buffer.indexOf('\n');
