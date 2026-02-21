@@ -4,3 +4,4 @@ dist/
 .runtime/
 .claude/commands/
 .logs/
+.build/
