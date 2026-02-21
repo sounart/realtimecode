@@ -7,7 +7,7 @@ import type {
   UtteranceMetadata
 } from '@realtimecode/protocol';
 import { logger } from '@realtimecode/shared';
-import { detectBoundary, type BoundaryInput } from './boundary-detector.js';
+import { BoundaryDetector, detectBoundary, type BoundaryInput } from './boundary-detector.js';
 import { evaluateInstruction } from './policy-engine.js';
 import { RealtimeClient } from './realtime-client.js';
 import { SparkBridge } from './spark-bridge.js';
@@ -24,6 +24,7 @@ export type SessionStatus = {
 export class SessionManager {
   private orchestratorState: OrchestratorState = 'idle';
   private realtimeClient: RealtimeClient | null = null;
+  private boundaryDetector: BoundaryDetector | null = null;
   private spark: SparkBridge | null = null;
   private assembler = new TranscriptAssembler();
   private sessionId: string | null = null;
@@ -82,12 +83,40 @@ export class SessionManager {
     });
     this.spark.startSession(workdir);
 
-    this.realtimeClient = new RealtimeClient({
-      apiKey: process.env.OPENAI_API_KEY ?? ''
-    });
+    // Initialize audio pipeline: RealtimeClient → BoundaryDetector → commitUtterance
+    this.assembler = new TranscriptAssembler();
+
+    const apiKey = process.env.OPENAI_API_KEY ?? '';
+    this.realtimeClient = new RealtimeClient({ apiKey });
+
+    this.boundaryDetector = new BoundaryDetector(this.assembler);
+    this.boundaryDetector.attach(this.realtimeClient);
+
     this.realtimeClient.on('transcription.delta', (text: string) => {
       this.handlePartialTranscript(text);
     });
+
+    this.realtimeClient.on('error', (err: Error) => {
+      logger.warn({ error: err.message }, 'realtime client error');
+    });
+
+    this.boundaryDetector.on('utterance-committed', (transcript: string, reason: BoundaryReason) => {
+      this.handleCommittedUtterance(transcript, reason);
+    });
+
+    this.boundaryDetector.on('speech-active', () => {
+      if (this.orchestratorState === 'executing' && this.activeInstructionId && this.spark) {
+        logger.info({ instructionId: this.activeInstructionId }, 'cancelling active instruction due to new speech');
+        this.spark.cancelInstruction(this.activeInstructionId);
+        this.activeInstructionId = null;
+      }
+    });
+
+    if (apiKey) {
+      this.realtimeClient.connect();
+    } else {
+      logger.warn('OPENAI_API_KEY not set — realtime client not connected');
+    }
 
     this.orchestratorState = 'listening';
     this.broadcastStatus();
@@ -103,9 +132,12 @@ export class SessionManager {
   }
 
   stopSession(): void {
+    this.boundaryDetector?.destroy();
+    this.boundaryDetector = null;
+    this.realtimeClient?.disconnect();
+    this.realtimeClient = null;
     this.spark?.stopSession();
     this.spark = null;
-    this.realtimeClient = null;
     this.assembler = new TranscriptAssembler();
     this.activeInstructionId = null;
 
@@ -132,6 +164,15 @@ export class SessionManager {
       state: this.orchestratorState,
       workdir: this.workdir
     };
+  }
+
+  appendAudio(base64Audio: string): void {
+    this.realtimeClient?.appendAudio(base64Audio);
+  }
+
+  commitHotkey(): void {
+    this.realtimeClient?.commitAudioBuffer();
+    this.boundaryDetector?.commitHotkey();
   }
 
   cancelInstruction(id: string): boolean {
@@ -215,6 +256,42 @@ export class SessionManager {
     if (this.orchestratorState === 'transcribing') {
       this.commitUtterance('manual_commit');
     }
+  }
+
+  private handleCommittedUtterance(transcript: string, reason: BoundaryReason): void {
+    logger.info({ transcript, reason }, 'boundary detector committed utterance');
+
+    const decision = evaluateInstruction(transcript);
+
+    if (!decision.allowed) {
+      this.broadcast({
+        type: 'error',
+        message: decision.reason ?? 'Instruction blocked by policy',
+        code: 'POLICY_BLOCKED',
+        recoverable: true,
+        timestamp: new Date().toISOString()
+      });
+      this.orchestratorState = 'listening';
+      this.broadcastStatus();
+      return;
+    }
+
+    if (!this.spark) {
+      this.orchestratorState = 'listening';
+      this.broadcastStatus();
+      return;
+    }
+
+    this.orchestratorState = 'executing';
+    this.broadcastStatus();
+
+    const metadata: UtteranceMetadata = {
+      timestamp: new Date().toISOString(),
+      confidence: 1.0,
+      boundaryReason: reason
+    };
+
+    this.activeInstructionId = this.spark.submitInstruction(transcript, metadata);
   }
 
   private commitUtterance(reason: BoundaryReason): void {
