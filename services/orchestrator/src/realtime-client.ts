@@ -30,6 +30,9 @@ type ServerEvent =
 export class RealtimeClient extends EventEmitter<RealtimeClientEvents> {
   private ws: WebSocket | null = null;
   private readonly options: Required<RealtimeClientOptions>;
+  private reconnectAttempts = 0;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private shouldReconnect = true;
 
   constructor(options: RealtimeClientOptions) {
     super();
@@ -43,29 +46,38 @@ export class RealtimeClient extends EventEmitter<RealtimeClientEvents> {
   }
 
   connect(): void {
+    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+
+    this.shouldReconnect = true;
     const url = `wss://api.openai.com/v1/realtime?model=${this.options.model}`;
-    this.ws = new WebSocket(url, {
+    const ws = new WebSocket(url, {
       headers: {
         Authorization: `Bearer ${this.options.apiKey}`,
         'OpenAI-Beta': 'realtime=v1',
       },
     });
+    this.ws = ws;
 
-    this.ws.on('open', () => {
+    ws.on('open', () => {
+      this.reconnectAttempts = 0;
       this.sendSessionUpdate();
     });
 
-    this.ws.on('message', (data: WebSocket.Data) => {
+    ws.on('message', (data: WebSocket.Data) => {
       this.handleMessage(data);
     });
 
-    this.ws.on('error', (err: Error) => {
+    ws.on('error', (err: Error) => {
       this.emit('error', err);
+      this.scheduleReconnect();
     });
 
-    this.ws.on('close', () => {
+    ws.on('close', () => {
       this.ws = null;
       this.emit('close');
+      this.scheduleReconnect();
     });
   }
 
@@ -85,6 +97,12 @@ export class RealtimeClient extends EventEmitter<RealtimeClientEvents> {
   }
 
   disconnect(): void {
+    this.shouldReconnect = false;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -149,5 +167,29 @@ export class RealtimeClient extends EventEmitter<RealtimeClientEvents> {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(message));
     }
+  }
+
+  private scheduleReconnect(): void {
+    if (!this.shouldReconnect || this.reconnectTimer) {
+      return;
+    }
+
+    if (this.reconnectAttempts >= 5) {
+      this.emit('error', new Error('Realtime websocket reconnect attempts exhausted'));
+      return;
+    }
+
+    this.reconnectAttempts += 1;
+    const delayMs = Math.min(1000 * (2 ** (this.reconnectAttempts - 1)), 30000);
+
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+
+      if (!this.shouldReconnect) {
+        return;
+      }
+
+      this.connect();
+    }, delayMs);
   }
 }

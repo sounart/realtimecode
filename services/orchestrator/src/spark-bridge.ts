@@ -142,6 +142,24 @@ export class SparkBridge {
 
     this.activeProcess = proc;
 
+    const timeout = setTimeout(() => {
+      if (this.activeInstructionId !== instructionId || this.activeProcess !== proc) {
+        return;
+      }
+
+      logger.error({ instructionId }, 'instruction execution timed out');
+      proc.kill('SIGTERM');
+      this.broadcast({
+        type: 'error',
+        message: 'Instruction execution timed out after 30s',
+        code: 'SPARK_TIMEOUT',
+        recoverable: true,
+        timestamp: now()
+      });
+      this.activeProcess = null;
+      this.activeInstructionId = null;
+    }, 30_000);
+
     proc.stdin?.write(JSON.stringify({ instruction: text, metadata }) + '\n');
     proc.stdin?.end();
 
@@ -189,6 +207,8 @@ export class SparkBridge {
 
     await new Promise<void>((resolve) => {
       proc.on('close', () => {
+        clearTimeout(timeout);
+
         if (this.activeProcess === proc) {
           this.activeProcess = null;
         }

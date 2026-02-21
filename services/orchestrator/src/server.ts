@@ -16,11 +16,15 @@ import { SessionManager } from './session-manager.js';
 
 const session = new SessionManager();
 const connectedSockets = new Set<net.Socket>();
+let shuttingDown = false;
+let activeServer: net.Server | null = null;
 
 session.onEvent((event: StreamEvent) => {
+  const method = `event.${event.type}`;
+
   const notification = JSON.stringify({
     jsonrpc: '2.0',
-    method: 'event.stream',
+    method,
     params: event
   });
 
@@ -29,11 +33,11 @@ session.onEvent((event: StreamEvent) => {
   }
 });
 
-function okResponse(id: JsonRpcRequest['id'], result: unknown): JsonRpcResponse {
+function okResponse(id: JsonRpcResponse['id'], result: unknown): JsonRpcResponse {
   return { jsonrpc: '2.0', id, result };
 }
 
-function errorResponse(id: JsonRpcRequest['id'], code: number, message: string): JsonRpcResponse {
+function errorResponse(id: JsonRpcResponse['id'], code: number, message: string): JsonRpcResponse {
   const error: JsonRpcError = { code, message };
   return { jsonrpc: '2.0', id, error };
 }
@@ -52,16 +56,18 @@ function parseRequest(line: string): JsonRpcRequest | null {
   }
 }
 
-function handleRequest(request: JsonRpcRequest): JsonRpcResponse {
+function handleRequest(request: JsonRpcRequest): JsonRpcResponse | null {
+  const responseId = request.id ?? null;
+
   switch (request.method) {
     case 'session.start': {
       try {
         const params = request.params as SessionStartRequest;
         const result = session.startSession(params.workdir, params.profile);
-        return okResponse(request.id, result);
+        return okResponse(responseId, result);
       } catch (error) {
         return errorResponse(
-          request.id,
+          responseId,
           -32000,
           error instanceof Error ? error.message : 'Failed to start session'
         );
@@ -69,16 +75,16 @@ function handleRequest(request: JsonRpcRequest): JsonRpcResponse {
     }
     case 'session.status': {
       const status = session.getStatus();
-      return okResponse(request.id, status);
+      return okResponse(responseId, status);
     }
     case 'instruction.submit': {
       try {
         const params = request.params as InstructionSubmitRequest;
         const result = session.submitText(params.text, params.metadata);
-        return okResponse(request.id, result);
+        return okResponse(responseId, result);
       } catch (error) {
         return errorResponse(
-          request.id,
+          responseId,
           -32000,
           error instanceof Error ? error.message : 'Failed to submit instruction'
         );
@@ -87,16 +93,53 @@ function handleRequest(request: JsonRpcRequest): JsonRpcResponse {
     case 'instruction.cancel': {
       const params = request.params as InstructionCancelRequest;
       const cancelled = session.cancelInstruction(params.instructionId);
-      return okResponse(request.id, { cancelled });
+      return okResponse(responseId, { cancelled });
     }
     case 'session.stop': {
       const params = request.params as SessionStopRequest;
       session.stopSession();
-      return okResponse(request.id, { stopped: true, sessionId: params.sessionId });
+      return okResponse(responseId, { stopped: true, sessionId: params.sessionId });
+    }
+    case 'audio.stream': {
+      const params = (request.params ?? {}) as { audio?: string };
+      if (typeof params.audio === 'string' && params.audio.length > 0) {
+        session.appendAudio(params.audio);
+      }
+      return request.id === undefined ? null : okResponse(responseId, { accepted: true });
+    }
+    case 'audio.commit': {
+      session.commitHotkey();
+      return request.id === undefined ? null : okResponse(responseId, { committed: true });
     }
     default:
-      return errorResponse(request.id, -32601, `Unknown method: ${String(request.method)}`);
+      return errorResponse(responseId, -32601, `Unknown method: ${String(request.method)}`);
   }
+}
+
+async function shutdown(code = 0): Promise<void> {
+  if (shuttingDown) {
+    return;
+  }
+
+  shuttingDown = true;
+  session.stopSession();
+
+  for (const socket of connectedSockets) {
+    socket.end();
+  }
+
+  await new Promise<void>((resolve) => {
+    if (!activeServer) {
+      resolve();
+      return;
+    }
+
+    activeServer.close(() => resolve());
+  });
+
+  await removeStaleSocket(config.socketPath);
+  logger.info('orchestrator stopped');
+  process.exit(code);
 }
 
 async function removeStaleSocket(pathname: string): Promise<void> {
@@ -134,7 +177,9 @@ async function startServer(): Promise<void> {
             ? handleRequest(request)
             : errorResponse(null, -32700, 'Parse error');
 
-          socket.write(`${JSON.stringify(response)}\n`);
+          if (response) {
+            socket.write(`${JSON.stringify(response)}\n`);
+          }
         }
 
         newline = buffer.indexOf('\n');
@@ -151,19 +196,27 @@ async function startServer(): Promise<void> {
     });
   });
 
+  activeServer = server;
+
   server.listen(config.socketPath, () => {
     logger.info({ socketPath: config.socketPath }, 'orchestrator listening');
   });
 
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     process.on(signal, () => {
-      session.stopSession();
-      server.close(() => {
-        logger.info('orchestrator stopped');
-        void removeStaleSocket(config.socketPath).finally(() => process.exit(0));
-      });
+      void shutdown(0);
     });
   }
+
+  process.on('uncaughtException', (error) => {
+    logger.error({ error }, 'uncaught exception in orchestrator');
+    void shutdown(1);
+  });
+
+  process.on('unhandledRejection', (error) => {
+    logger.error({ error }, 'unhandled rejection in orchestrator');
+    void shutdown(1);
+  });
 }
 
 await startServer();

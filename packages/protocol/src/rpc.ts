@@ -4,14 +4,16 @@ export type JsonRpcId = string | number | null;
 
 export type JsonRpcRequest = {
   jsonrpc: '2.0';
-  id: JsonRpcId;
+  id?: JsonRpcId;
   method:
     | 'session.start'
     | 'session.status'
     | 'session.stop'
     | 'instruction.submit'
-    | 'instruction.cancel';
-  params: unknown;
+    | 'instruction.cancel'
+    | 'audio.stream'
+    | 'audio.commit';
+  params?: unknown;
 };
 
 export type JsonRpcError = {

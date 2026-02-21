@@ -2,8 +2,16 @@ export type StreamEvent =
   | StdoutEvent
   | ToolCallEvent
   | FileChangeEvent
+  | TranscriptEvent
   | StatusEvent
   | ErrorEvent;
+
+export type TranscriptEvent = {
+  type: 'transcript';
+  text: string;
+  final: boolean;
+  timestamp: string;
+};
 
 export type StdoutEvent = {
   type: 'stdout';

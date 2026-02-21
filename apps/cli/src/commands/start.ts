@@ -1,5 +1,7 @@
 import { select, input } from '@inquirer/prompts';
+import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import path from 'node:path';
 import type { JsonRpcResponse, StreamEvent } from '@realtimecode/protocol';
@@ -66,10 +68,66 @@ function sendRpc(
   });
 }
 
+function canConnect(socketPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = net.createConnection(socketPath);
+    socket.setTimeout(500);
+
+    socket.once('connect', () => {
+      socket.destroy();
+      resolve(true);
+    });
+
+    socket.once('timeout', () => {
+      socket.destroy();
+      resolve(false);
+    });
+
+    socket.once('error', () => {
+      resolve(false);
+    });
+  });
+}
+
+async function ensureOrchestratorRunning(): Promise<void> {
+  if (await canConnect(config.socketPath)) {
+    return;
+  }
+
+  const thisFile = fileURLToPath(import.meta.url);
+  const repoRoot = path.resolve(path.dirname(thisFile), '../../../../');
+  const daemon = spawn('npx', ['tsx', 'services/orchestrator/src/server.ts'], {
+    cwd: repoRoot,
+    detached: true,
+    stdio: 'ignore'
+  });
+  daemon.unref();
+
+  const timeoutMs = 15000;
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    try {
+      await fs.stat(config.socketPath);
+      if (await canConnect(config.socketPath)) {
+        return;
+      }
+    } catch {
+      // Socket not ready yet.
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+
+  throw new Error(`Failed to start orchestrator daemon within ${timeoutMs}ms`);
+}
+
 function formatEvent(event: StreamEvent): string {
   switch (event.type) {
     case 'status':
       return `[status] ${event.state}`;
+    case 'transcript':
+      return event.final ? `[transcript final] ${event.text}` : `[transcript] ${event.text}`;
     case 'stdout':
       return event.chunk.trimEnd();
     case 'tool_call':
@@ -96,7 +154,7 @@ function streamEvents(socket: net.Socket): void {
         try {
           const parsed = JSON.parse(line) as { method?: string; params?: StreamEvent };
 
-          if (parsed.method === 'event.stream' && parsed.params) {
+          if (parsed.method && (parsed.method === 'event.stream' || parsed.method.startsWith('event.')) && parsed.params) {
             console.log(formatEvent(parsed.params));
           }
         } catch {
@@ -143,6 +201,7 @@ export async function runStart(): Promise<void> {
       : selected;
 
   console.log(`Connecting to orchestrator at ${config.socketPath}...`);
+  await ensureOrchestratorRunning();
 
   const socket = net.createConnection(config.socketPath);
   socket.setEncoding('utf8');

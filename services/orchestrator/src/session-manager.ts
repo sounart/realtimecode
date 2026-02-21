@@ -242,6 +242,13 @@ export class SessionManager {
 
     this.assembler.append(text);
     this.lastPartialMs = ts;
+
+    this.broadcast({
+      type: 'transcript',
+      text,
+      final: false,
+      timestamp: new Date(ts).toISOString()
+    });
   }
 
   checkBoundary(input: BoundaryInput): void {
@@ -260,6 +267,13 @@ export class SessionManager {
 
   private handleCommittedUtterance(transcript: string, reason: BoundaryReason): void {
     logger.info({ transcript, reason }, 'boundary detector committed utterance');
+
+    this.broadcast({
+      type: 'transcript',
+      text: transcript,
+      final: true,
+      timestamp: new Date().toISOString()
+    });
 
     const decision = evaluateInstruction(transcript);
 
@@ -304,6 +318,13 @@ export class SessionManager {
     }
 
     logger.info({ transcript, reason }, 'utterance committed');
+
+    this.broadcast({
+      type: 'transcript',
+      text: transcript,
+      final: true,
+      timestamp: new Date().toISOString()
+    });
 
     const decision = evaluateInstruction(transcript);
 
