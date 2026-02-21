@@ -1,101 +1,260 @@
-import { EventEmitter } from 'node:events';
-import type { BoundaryReason } from '@realtimecode/protocol';
-import { RealtimeClient, type RealtimeClientOptions } from './realtime-client.js';
-import { BoundaryDetector, type BoundaryDetectorConfig } from './boundary-detector.js';
+import type {
+  BoundaryReason,
+  InstructionSubmitResponse,
+  SessionStartResponse,
+  SparkProfile,
+  StreamEvent,
+  UtteranceMetadata
+} from '@realtimecode/protocol';
+import { logger } from '@realtimecode/shared';
+import { detectBoundary, type BoundaryInput } from './boundary-detector.js';
+import { evaluateInstruction } from './policy-engine.js';
+import { RealtimeClient } from './realtime-client.js';
+import { SparkBridge } from './spark-bridge.js';
 import { TranscriptAssembler } from './transcript-assembler.js';
 
-export type SessionState = 'idle' | 'active' | 'stopped';
+export type OrchestratorState = 'idle' | 'listening' | 'transcribing' | 'executing';
 
-export interface SessionManagerEvents {
-  'utterance-committed': [transcript: string, reason: BoundaryReason];
-  'speech-active': [];
-  'speech-inactive': [];
-  'transcription-delta': [text: string];
-  'session-ready': [];
-  'error': [error: Error];
-  'closed': [];
-}
+export type SessionStatus = {
+  sessionId: string | null;
+  state: OrchestratorState;
+  workdir: string | null;
+};
 
-export interface SessionManagerOptions {
-  realtimeClient: RealtimeClientOptions;
-  boundaryDetector?: Partial<BoundaryDetectorConfig>;
-}
+export class SessionManager {
+  private orchestratorState: OrchestratorState = 'idle';
+  private realtimeClient: RealtimeClient | null = null;
+  private spark: SparkBridge | null = null;
+  private assembler = new TranscriptAssembler();
+  private sessionId: string | null = null;
+  private workdir: string | null = null;
+  private activeInstructionId: string | null = null;
+  private utteranceStartMs = 0;
+  private lastPartialMs = 0;
+  private handlers: Array<(event: StreamEvent) => void> = [];
 
-export class SessionManager extends EventEmitter<SessionManagerEvents> {
-  private activeSessionId: string | null = null;
-  private client: RealtimeClient | null = null;
-  private detector: BoundaryDetector | null = null;
-  private assembler: TranscriptAssembler | null = null;
-
-  get state(): SessionState {
-    if (this.activeSessionId === null) return 'idle';
-    return this.activeSessionId === 'stopped' ? 'stopped' : 'active';
+  onEvent(handler: (event: StreamEvent) => void): void {
+    this.handlers.push(handler);
   }
 
-  get sessionId(): string | null {
-    return this.activeSessionId;
+  private broadcast(event: StreamEvent): void {
+    for (const handler of this.handlers) {
+      handler(event);
+    }
   }
 
-  start(options: SessionManagerOptions): string {
-    if (this.state === 'active') {
-      this.stop();
+  private broadcastStatus(): void {
+    if (!this.sessionId) {
+      return;
     }
 
-    this.activeSessionId = `session-${Date.now()}`;
+    this.broadcast({
+      type: 'status',
+      sessionId: this.sessionId,
+      state: this.orchestratorState === 'idle'
+        ? 'idle'
+        : this.orchestratorState === 'listening'
+          ? 'listening'
+          : this.orchestratorState === 'transcribing'
+            ? 'transcribing'
+            : 'executing',
+      timestamp: new Date().toISOString()
+    });
+  }
 
+  startSession(workdir: string, profile: SparkProfile): SessionStartResponse {
+    if (this.orchestratorState !== 'idle') {
+      throw new Error('Session already active');
+    }
+
+    this.sessionId = `session-${Date.now()}`;
+    this.workdir = workdir;
+
+    this.spark = new SparkBridge();
+    this.spark.onEvent((event) => {
+      this.broadcast(event);
+
+      if (!this.spark?.isExecuting && this.orchestratorState === 'executing') {
+        this.orchestratorState = 'listening';
+        this.activeInstructionId = null;
+        this.broadcastStatus();
+      }
+    });
+    this.spark.startSession(workdir);
+
+    this.realtimeClient = new RealtimeClient((text) => {
+      this.handlePartialTranscript(text);
+    });
+
+    this.orchestratorState = 'listening';
+    this.broadcastStatus();
+
+    logger.info({ sessionId: this.sessionId, workdir, profile }, 'session started');
+
+    return {
+      sessionId: this.sessionId,
+      workdir,
+      profile,
+      acceptedAt: new Date().toISOString()
+    };
+  }
+
+  stopSession(): void {
+    this.spark?.stopSession();
+    this.spark = null;
+    this.realtimeClient = null;
     this.assembler = new TranscriptAssembler();
-    this.client = new RealtimeClient(options.realtimeClient);
-    this.detector = new BoundaryDetector(this.assembler, options.boundaryDetector);
+    this.activeInstructionId = null;
 
-    this.detector.attach(this.client);
+    const prevSessionId = this.sessionId;
+    this.sessionId = null;
+    this.workdir = null;
+    this.orchestratorState = 'idle';
 
-    this.client.on('session.created', () => {
-      this.emit('session-ready');
-    });
+    if (prevSessionId) {
+      this.broadcast({
+        type: 'status',
+        sessionId: prevSessionId,
+        state: 'idle',
+        timestamp: new Date().toISOString()
+      });
+    }
 
-    this.client.on('transcription.delta', (text) => {
-      this.emit('transcription-delta', text);
-    });
-
-    this.client.on('error', (err) => {
-      this.emit('error', err);
-    });
-
-    this.client.on('close', () => {
-      this.emit('closed');
-    });
-
-    this.detector.on('utterance-committed', (transcript, reason) => {
-      this.emit('utterance-committed', transcript, reason);
-    });
-
-    this.detector.on('speech-active', () => {
-      this.emit('speech-active');
-    });
-
-    this.detector.on('speech-inactive', () => {
-      this.emit('speech-inactive');
-    });
-
-    this.client.connect();
-    return this.activeSessionId;
+    logger.info('session stopped');
   }
 
-  appendAudio(base64Audio: string): void {
-    this.client?.appendAudio(base64Audio);
+  getStatus(): SessionStatus {
+    return {
+      sessionId: this.sessionId,
+      state: this.orchestratorState,
+      workdir: this.workdir
+    };
   }
 
-  commitHotkey(): void {
-    this.client?.commitAudioBuffer();
-    this.detector?.commitHotkey();
+  cancelInstruction(id: string): boolean {
+    if (!this.spark) {
+      return false;
+    }
+
+    const cancelled = this.spark.cancelInstruction(id);
+
+    if (cancelled) {
+      this.activeInstructionId = null;
+      this.orchestratorState = 'listening';
+      this.broadcastStatus();
+    }
+
+    return cancelled;
   }
 
-  stop(): void {
-    this.detector?.destroy();
-    this.client?.disconnect();
-    this.client = null;
-    this.detector = null;
-    this.assembler = null;
-    this.activeSessionId = 'stopped';
+  submitText(text: string, metadata: UtteranceMetadata): InstructionSubmitResponse {
+    if (!this.spark || this.orchestratorState === 'idle') {
+      throw new Error('No active session');
+    }
+
+    const decision = evaluateInstruction(text);
+
+    if (!decision.allowed) {
+      this.broadcast({
+        type: 'error',
+        message: decision.reason ?? 'Instruction blocked by policy',
+        code: 'POLICY_BLOCKED',
+        recoverable: true,
+        timestamp: new Date().toISOString()
+      });
+
+      return { instructionId: '', queued: false };
+    }
+
+    if (this.activeInstructionId) {
+      this.spark.cancelInstruction(this.activeInstructionId);
+    }
+
+    this.orchestratorState = 'executing';
+    this.broadcastStatus();
+
+    this.activeInstructionId = this.spark.submitInstruction(text, metadata);
+
+    return { instructionId: this.activeInstructionId, queued: true };
+  }
+
+  handlePartialTranscript(text: string): void {
+    const ts = Date.now();
+
+    if (this.orchestratorState === 'executing' && this.activeInstructionId && this.spark) {
+      logger.info(
+        { instructionId: this.activeInstructionId },
+        'cancelling active instruction due to new speech'
+      );
+      this.spark.cancelInstruction(this.activeInstructionId);
+      this.activeInstructionId = null;
+    }
+
+    if (this.orchestratorState === 'listening' || this.orchestratorState === 'executing') {
+      this.orchestratorState = 'transcribing';
+      this.utteranceStartMs = ts;
+      this.broadcastStatus();
+    }
+
+    this.assembler.append(text);
+    this.lastPartialMs = ts;
+  }
+
+  checkBoundary(input: BoundaryInput): void {
+    const reason = detectBoundary(input);
+
+    if (reason && this.orchestratorState === 'transcribing') {
+      this.commitUtterance(reason);
+    }
+  }
+
+  commitManual(): void {
+    if (this.orchestratorState === 'transcribing') {
+      this.commitUtterance('manual_commit');
+    }
+  }
+
+  private commitUtterance(reason: BoundaryReason): void {
+    const transcript = this.assembler.commit();
+
+    if (transcript.length === 0) {
+      this.orchestratorState = 'listening';
+      this.broadcastStatus();
+      return;
+    }
+
+    logger.info({ transcript, reason }, 'utterance committed');
+
+    const decision = evaluateInstruction(transcript);
+
+    if (!decision.allowed) {
+      this.broadcast({
+        type: 'error',
+        message: decision.reason ?? 'Instruction blocked by policy',
+        code: 'POLICY_BLOCKED',
+        recoverable: true,
+        timestamp: new Date().toISOString()
+      });
+      this.orchestratorState = 'listening';
+      this.broadcastStatus();
+      return;
+    }
+
+    if (!this.spark) {
+      this.orchestratorState = 'listening';
+      this.broadcastStatus();
+      return;
+    }
+
+    this.orchestratorState = 'executing';
+    this.broadcastStatus();
+
+    const metadata: UtteranceMetadata = {
+      timestamp: new Date().toISOString(),
+      confidence: 1.0,
+      boundaryReason: reason
+    };
+
+    this.activeInstructionId = this.spark.submitInstruction(transcript, metadata);
   }
 }
