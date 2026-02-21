@@ -1,15 +1,33 @@
 import net from 'node:net';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import {
-  type InstructionSubmitRequest,
-  type JsonRpcError,
-  type JsonRpcRequest,
-  type JsonRpcResponse,
-  type SessionStartRequest,
-  type SessionStopRequest
+import type {
+  InstructionCancelRequest,
+  InstructionSubmitRequest,
+  JsonRpcError,
+  JsonRpcRequest,
+  JsonRpcResponse,
+  SessionStartRequest,
+  SessionStopRequest,
+  StreamEvent
 } from '@realtimecode/protocol';
 import { config, logger } from '@realtimecode/shared';
+import { SessionManager } from './session-manager.js';
+
+const session = new SessionManager();
+const connectedSockets = new Set<net.Socket>();
+
+session.onEvent((event: StreamEvent) => {
+  const notification = JSON.stringify({
+    jsonrpc: '2.0',
+    method: 'event.stream',
+    params: event
+  });
+
+  for (const socket of connectedSockets) {
+    socket.write(notification + '\n');
+  }
+});
 
 function okResponse(id: JsonRpcRequest['id'], result: unknown): JsonRpcResponse {
   return { jsonrpc: '2.0', id, result };
@@ -37,31 +55,47 @@ function parseRequest(line: string): JsonRpcRequest | null {
 function handleRequest(request: JsonRpcRequest): JsonRpcResponse {
   switch (request.method) {
     case 'session.start': {
-      const params = request.params as SessionStartRequest;
-      return okResponse(request.id, {
-        sessionId: `session-${Date.now()}`,
-        workdir: params.workdir,
-        profile: params.profile,
-        acceptedAt: new Date().toISOString()
-      });
+      try {
+        const params = request.params as SessionStartRequest;
+        const result = session.startSession(params.workdir, params.profile);
+        return okResponse(request.id, result);
+      } catch (error) {
+        return errorResponse(
+          request.id,
+          -32000,
+          error instanceof Error ? error.message : 'Failed to start session'
+        );
+      }
+    }
+    case 'session.status': {
+      const status = session.getStatus();
+      return okResponse(request.id, status);
     }
     case 'instruction.submit': {
-      const params = request.params as InstructionSubmitRequest;
-      return okResponse(request.id, {
-        instructionId: `instruction-${Date.now()}`,
-        receivedText: params.text,
-        queued: true
-      });
+      try {
+        const params = request.params as InstructionSubmitRequest;
+        const result = session.submitText(params.text, params.metadata);
+        return okResponse(request.id, result);
+      } catch (error) {
+        return errorResponse(
+          request.id,
+          -32000,
+          error instanceof Error ? error.message : 'Failed to submit instruction'
+        );
+      }
     }
     case 'instruction.cancel': {
-      return okResponse(request.id, { cancelled: true });
+      const params = request.params as InstructionCancelRequest;
+      const cancelled = session.cancelInstruction(params.instructionId);
+      return okResponse(request.id, { cancelled });
     }
     case 'session.stop': {
       const params = request.params as SessionStopRequest;
+      session.stopSession();
       return okResponse(request.id, { stopped: true, sessionId: params.sessionId });
     }
     default:
-      return errorResponse(request.id, -32601, `Unknown method: ${request.method}`);
+      return errorResponse(request.id, -32601, `Unknown method: ${String(request.method)}`);
   }
 }
 
@@ -82,6 +116,7 @@ async function startServer(): Promise<void> {
 
   const server = net.createServer((socket) => {
     socket.setEncoding('utf8');
+    connectedSockets.add(socket);
 
     let buffer = '';
 
@@ -106,7 +141,12 @@ async function startServer(): Promise<void> {
       }
     });
 
+    socket.on('close', () => {
+      connectedSockets.delete(socket);
+    });
+
     socket.on('error', (error) => {
+      connectedSockets.delete(socket);
       logger.warn({ error }, 'socket error');
     });
   });
@@ -117,6 +157,7 @@ async function startServer(): Promise<void> {
 
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     process.on(signal, () => {
+      session.stopSession();
       server.close(() => {
         logger.info('orchestrator stopped');
         void removeStaleSocket(config.socketPath).finally(() => process.exit(0));

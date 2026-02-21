@@ -7,9 +7,10 @@ export type JsonRpcRequest = {
   id: JsonRpcId;
   method:
     | 'session.start'
+    | 'session.status'
+    | 'session.stop'
     | 'instruction.submit'
-    | 'instruction.cancel'
-    | 'session.stop';
+    | 'instruction.cancel';
   params: unknown;
 };
 
