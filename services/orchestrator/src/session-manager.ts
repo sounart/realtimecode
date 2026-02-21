@@ -82,7 +82,10 @@ export class SessionManager {
     });
     this.spark.startSession(workdir);
 
-    this.realtimeClient = new RealtimeClient((text) => {
+    this.realtimeClient = new RealtimeClient({
+      apiKey: process.env.OPENAI_API_KEY ?? ''
+    });
+    this.realtimeClient.on('transcription.delta', (text: string) => {
       this.handlePartialTranscript(text);
     });
 
