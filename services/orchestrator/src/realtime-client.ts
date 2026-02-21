@@ -37,7 +37,7 @@ export class RealtimeClient extends EventEmitter<RealtimeClientEvents> {
   constructor(options: RealtimeClientOptions) {
     super();
     this.options = {
-      model: 'gpt-realtime',
+      model: 'gpt-4o-realtime-preview',
       vadThreshold: 0.5,
       silenceDurationMs: 650,
       prefixPaddingMs: 300,

@@ -7,7 +7,7 @@ import type {
   UtteranceMetadata
 } from '@realtimecode/protocol';
 import { logger } from '@realtimecode/shared';
-import { BoundaryDetector, detectBoundary, type BoundaryInput } from './boundary-detector.js';
+import { BoundaryDetector } from './boundary-detector.js';
 import { evaluateInstruction } from './policy-engine.js';
 import { RealtimeClient } from './realtime-client.js';
 import { SparkBridge } from './spark-bridge.js';
@@ -240,7 +240,7 @@ export class SessionManager {
       this.broadcastStatus();
     }
 
-    this.assembler.append(text);
+    // Note: assembler.append is handled by BoundaryDetector.onTranscriptDelta
     this.lastPartialMs = ts;
 
     this.broadcast({
@@ -251,17 +251,9 @@ export class SessionManager {
     });
   }
 
-  checkBoundary(input: BoundaryInput): void {
-    const reason = detectBoundary(input);
-
-    if (reason && this.orchestratorState === 'transcribing') {
-      this.commitUtterance(reason);
-    }
-  }
-
   commitManual(): void {
     if (this.orchestratorState === 'transcribing') {
-      this.commitUtterance('manual_commit');
+      this.boundaryDetector?.commitHotkey();
     }
   }
 
@@ -308,54 +300,4 @@ export class SessionManager {
     this.activeInstructionId = this.spark.submitInstruction(transcript, metadata);
   }
 
-  private commitUtterance(reason: BoundaryReason): void {
-    const transcript = this.assembler.commit();
-
-    if (transcript.length === 0) {
-      this.orchestratorState = 'listening';
-      this.broadcastStatus();
-      return;
-    }
-
-    logger.info({ transcript, reason }, 'utterance committed');
-
-    this.broadcast({
-      type: 'transcript',
-      text: transcript,
-      final: true,
-      timestamp: new Date().toISOString()
-    });
-
-    const decision = evaluateInstruction(transcript);
-
-    if (!decision.allowed) {
-      this.broadcast({
-        type: 'error',
-        message: decision.reason ?? 'Instruction blocked by policy',
-        code: 'POLICY_BLOCKED',
-        recoverable: true,
-        timestamp: new Date().toISOString()
-      });
-      this.orchestratorState = 'listening';
-      this.broadcastStatus();
-      return;
-    }
-
-    if (!this.spark) {
-      this.orchestratorState = 'listening';
-      this.broadcastStatus();
-      return;
-    }
-
-    this.orchestratorState = 'executing';
-    this.broadcastStatus();
-
-    const metadata: UtteranceMetadata = {
-      timestamp: new Date().toISOString(),
-      confidence: 1.0,
-      boundaryReason: reason
-    };
-
-    this.activeInstructionId = this.spark.submitInstruction(transcript, metadata);
-  }
 }

@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Errors from the orchestrator IPC connection.
