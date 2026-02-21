@@ -5,4 +5,4 @@
 - [x] Shared protocol and config/logger packages created.
 - [ ] Realtime API integration.
 - [ ] Spark bridge runtime integration.
-- [ ] Menu bar hotkey + microphone permissions.
+- [x] Menu bar hotkey + microphone permissions.
