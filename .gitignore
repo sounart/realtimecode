@@ -5,3 +5,5 @@ dist/
 .claude/commands/
 .logs/
 .build/
+dolt/
+dolt-access.lock
