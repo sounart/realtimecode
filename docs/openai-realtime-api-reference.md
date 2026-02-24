@@ -1,111 +1,89 @@
-# OpenAI Realtime API Reference (for RealtimeCode implementation)
+# OpenAI Realtime API Reference (RealtimeCode)
 
-Source: https://developers.openai.com/api/docs/guides/realtime/
+Primary sources:
+- https://platform.openai.com/docs/guides/realtime-transcription
+- https://platform.openai.com/docs/guides/realtime
+- https://platform.openai.com/docs/guides/realtime-websocket
+- https://platform.openai.com/docs/guides/realtime-model-capabilities
+- https://platform.openai.com/docs/deprecations
 
-## Connection
+## GA vs Beta
 
-**WebSocket URL:**
+- Realtime should run on the GA interface.
+- The Realtime beta interface is scheduled for shutdown on **February 27, 2026**.
+- Do not send `OpenAI-Beta: realtime=v1` on new integrations.
+
+## WebSocket Connection
+
+Use a model-qualified Realtime URL:
+
+```text
+wss://api.openai.com/v1/realtime?model=<realtime_or_transcription_model>
 ```
-wss://api.openai.com/v1/realtime?model=gpt-realtime
-```
 
-**Auth Header:**
-```
+Auth header:
+
+```text
 Authorization: Bearer <OPENAI_API_KEY>
 ```
 
-## Session Setup
+## Session Setup (Transcription Mode)
 
-After connecting, send `session.update` to configure:
+After the socket opens, send `session.update`:
+
 ```json
 {
   "type": "session.update",
   "session": {
     "type": "transcription",
-    "input_audio_format": "pcm16",
-    "input_audio_transcription": {
-      "model": "gpt-4o-transcribe"
-    },
-    "turn_detection": {
-      "type": "server_vad",
-      "threshold": 0.5,
-      "prefix_padding_ms": 300,
-      "silence_duration_ms": 650
+    "audio": {
+      "input": {
+        "format": { "type": "audio/pcm", "rate": 24000 },
+        "transcription": {
+          "model": "gpt-4o-transcribe",
+          "language": "en"
+        },
+        "turn_detection": {
+          "type": "server_vad",
+          "threshold": 0.5,
+          "prefix_padding_ms": 300,
+          "silence_duration_ms": 800
+        },
+        "noise_reduction": { "type": "near_field" }
+      }
     }
   }
 }
 ```
 
-**IMPORTANT**: We use `"type": "transcription"` mode (NOT "realtime") because we only need speech-to-text, not speech-to-speech. We don't want the model to talk back — we just want the transcript to send to Codex Spark.
+Notes:
+- Keep mode as `transcription` for speech-to-text-only behavior.
+- Setting `transcription.language` can improve latency/accuracy when known.
 
-## Audio Format — PCM16
+## Audio Format
 
-- 16-bit signed little-endian PCM
-- 24kHz sample rate (mono)
-- Base64-encoded when sent over WebSocket
+- PCM16 signed little-endian
+- 24kHz mono
+- Base64-encoded in `input_audio_buffer.append`
 
-## Client Events
+## Core Client Events
 
-### session.update
-Configure session parameters.
+- `session.update`
+- `input_audio_buffer.append`
 
-### input_audio_buffer.append
-```json
-{
-  "type": "input_audio_buffer.append",
-  "audio": "<base64-encoded-pcm16>"
-}
-```
+## Core Server Events (Transcription)
 
-### input_audio_buffer.commit
-Force-commit the current audio buffer (for push-to-talk / hotkey release).
-```json
-{
-  "type": "input_audio_buffer.commit"
-}
-```
+- `session.created` / `session.updated`
+- `input_audio_buffer.speech_started`
+- `input_audio_buffer.speech_stopped`
+- `input_audio_buffer.committed`
+- `conversation.item.input_audio_transcription.delta`
+- `conversation.item.input_audio_transcription.completed`
+- `conversation.item.input_audio_transcription.failed`
+- `error`
 
-### input_audio_buffer.clear
-Clear buffered audio without committing.
+## Model Performance Notes
 
-## Server Events
+- `gpt-4o-mini-transcribe` is available as a lower-latency/cost option.
+- `gpt-4o-transcribe` is the higher-accuracy default.
 
-### session.created
-Confirms WebSocket session is ready.
-
-### input_audio_buffer.speech_started
-VAD detected speech start.
-
-### input_audio_buffer.speech_stopped
-VAD detected speech end (silence threshold crossed).
-
-### conversation.item.input_audio_transcription.completed
-Final transcript for a committed audio segment:
-```json
-{
-  "type": "conversation.item.input_audio_transcription.completed",
-  "transcript": "add a loading spinner to the main page"
-}
-```
-
-### conversation.item.input_audio_transcription.delta
-Partial/streaming transcript updates.
-
-### error
-Error events with message details.
-
-## Turn Detection (Server VAD)
-
-Server-side Voice Activity Detection handles utterance boundaries:
-- `threshold` (0.0-1.0): Sensitivity. Lower = more sensitive. Default 0.5.
-- `prefix_padding_ms`: Audio before speech detection to include. Default 300ms.
-- `silence_duration_ms`: How long silence before auto-commit. Default 650ms. Our ARCHITECTURE.md specifies 650ms.
-
-## Implementation Notes for RealtimeCode
-
-1. **Transcription-only mode**: Use `"type": "transcription"` — we don't need audio output, just text transcripts.
-2. **Audio capture**: Swift menu bar app captures mic → PCM16 24kHz mono → base64 → sends to Node orchestrator via IPC.
-3. **Orchestrator streams to Realtime API**: WebSocket connection, forwards audio chunks as `input_audio_buffer.append`.
-4. **Boundary detection**: Combine server VAD (`speech_stopped` events) with our hybrid detector (hotkey release = instant `input_audio_buffer.commit`, max 12s cap).
-5. **Transcript → Codex Spark**: On `transcription.completed`, boundary detector commits the transcript text to Spark bridge.
-6. **Cancellation**: If user starts speaking while Spark is executing, send cancel to Spark bridge before starting new turn.

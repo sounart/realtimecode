@@ -1,4 +1,5 @@
 import WebSocket from 'ws';
+import { logger } from './logger.js';
 
 export interface TranscriberCallbacks {
   onPartialTranscript: (text: string) => void;
@@ -10,6 +11,7 @@ export interface TranscriberCallbacks {
 interface TranscriberOptions {
   apiKey: string;
   model?: string;
+  language?: string;
   vadThreshold?: number;
   silenceDurationMs?: number;
   prefixPaddingMs?: number;
@@ -34,6 +36,8 @@ type ServerEvent =
   | { type: 'error'; error?: { message?: string }; message?: string }
   | { type: string };
 
+const DEFAULT_REALTIME_URL_BASE = 'wss://api.openai.com/v1/realtime';
+
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null;
 }
@@ -45,12 +49,51 @@ function getErrorMessage(event: Record<string, unknown>): string {
   return nestedMsg ?? directMsg ?? 'Unknown realtime error';
 }
 
+function resolveRealtimeUrl(rawUrl: string | undefined, model: string): string {
+  const fallback = `${DEFAULT_REALTIME_URL_BASE}?model=${encodeURIComponent(model)}`;
+  if (!rawUrl) return fallback;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    logger.warn('invalid RTC_REALTIME_URL; using default realtime endpoint');
+    return fallback;
+  }
+
+  if (parsed.protocol !== 'wss:') {
+    logger.warn('RTC_REALTIME_URL must use wss://; using default realtime endpoint', {
+      protocol: parsed.protocol,
+    });
+    return fallback;
+  }
+
+  const allowCustom = process.env['RTC_ALLOW_CUSTOM_REALTIME_URL'] === '1';
+  if (!allowCustom) {
+    const isDefaultHost = parsed.hostname === 'api.openai.com';
+    const isDefaultPath = parsed.pathname === '/v1/realtime';
+    if (!isDefaultHost || !isDefaultPath) {
+      logger.warn('custom realtime URL blocked; set RTC_ALLOW_CUSTOM_REALTIME_URL=1 to override', {
+        host: parsed.hostname,
+        path: parsed.pathname,
+      });
+      return fallback;
+    }
+  }
+
+  return parsed.toString();
+}
+
 export class Transcriber {
   private static readonly MAX_PENDING_AUDIO_CHUNKS = 64;
+  private static readonly MAX_TRACKED_EMITTED_ITEMS = 2_048;
+  private static readonly AUDIO_APPEND_PREFIX = '{"type":"input_audio_buffer.append","audio":"';
+  private static readonly AUDIO_APPEND_SUFFIX = '"}';
 
   private ws: WebSocket | null = null;
   private readonly apiKey: string;
   private readonly model: string;
+  private readonly language: string | null;
   private readonly vadThreshold: number;
   private readonly silenceDurationMs: number;
   private readonly prefixPaddingMs: number;
@@ -62,25 +105,30 @@ export class Transcriber {
   private reconnectAttempts = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private shouldReconnect = true;
-  private attemptedLegacyUpdate = false;
 
   private committedItemOrder: string[] = [];
+  private committedItemHead = 0;
   private committedItems = new Set<string>();
   private completedByItem = new Map<string, string>();
   private failedByItem = new Map<string, string>();
   private emittedItemIds = new Set<string>();
+  private emittedItemOrder: string[] = [];
+  private emittedItemHead = 0;
 
   private cb: TranscriberCallbacks;
 
   constructor(options: TranscriberOptions, callbacks: TranscriberCallbacks) {
     this.apiKey = options.apiKey;
-    this.model = options.model ?? 'gpt-4o-transcribe';
+    this.model = options.model
+      ?? process.env['RTC_TRANSCRIBE_MODEL']
+      ?? 'gpt-4o-transcribe';
+    this.language = options.language ?? process.env['RTC_TRANSCRIBE_LANGUAGE'] ?? null;
     this.vadThreshold = options.vadThreshold ?? 0.5;
     this.silenceDurationMs = options.silenceDurationMs ?? 800;
     this.prefixPaddingMs = options.prefixPaddingMs ?? 300;
     this.socketFactory = options.socketFactory
       ?? ((url: string, wsOptions?: object) => new WebSocket(url, wsOptions as never));
-    this.realtimeUrl = process.env['RTC_REALTIME_URL'] ?? 'wss://api.openai.com/v1/realtime';
+    this.realtimeUrl = resolveRealtimeUrl(process.env['RTC_REALTIME_URL'], this.model);
     this.cb = callbacks;
   }
 
@@ -90,14 +138,12 @@ export class Transcriber {
     }
 
     this.shouldReconnect = true;
-    this.attemptedLegacyUpdate = false;
     this.sessionReady = false;
     this.resetTranscriptOrdering();
 
     const ws = this.socketFactory(this.realtimeUrl, {
       headers: {
         Authorization: `Bearer ${this.apiKey}`,
-        'OpenAI-Beta': 'realtime=v1',
       },
     });
     this.ws = ws;
@@ -138,7 +184,7 @@ export class Transcriber {
 
   sendAudio(base64: string): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN && this.sessionReady) {
-      this.send({ type: 'input_audio_buffer.append', audio: base64 });
+      this.sendAudioChunk(base64);
       return;
     }
 
@@ -157,13 +203,21 @@ export class Transcriber {
 
   private resetTranscriptOrdering(): void {
     this.committedItemOrder = [];
+    this.committedItemHead = 0;
     this.committedItems.clear();
     this.completedByItem.clear();
     this.failedByItem.clear();
     this.emittedItemIds.clear();
+    this.emittedItemOrder = [];
+    this.emittedItemHead = 0;
   }
 
   private sendSessionUpdate(): void {
+    const transcription: Record<string, unknown> = { model: this.model };
+    if (this.language) {
+      transcription['language'] = this.language;
+    }
+
     this.send({
       type: 'session.update',
       session: {
@@ -171,7 +225,7 @@ export class Transcriber {
         audio: {
           input: {
             format: { type: 'audio/pcm', rate: 24_000 },
-            transcription: { model: this.model },
+            transcription,
             turn_detection: {
               type: 'server_vad',
               threshold: this.vadThreshold,
@@ -180,22 +234,6 @@ export class Transcriber {
             },
             noise_reduction: { type: 'near_field' },
           },
-        },
-      },
-    });
-  }
-
-  private sendLegacySessionUpdate(): void {
-    this.send({
-      type: 'transcription_session.update',
-      session: {
-        input_audio_format: 'pcm16',
-        input_audio_transcription: { model: this.model },
-        turn_detection: {
-          type: 'server_vad',
-          threshold: this.vadThreshold,
-          prefix_padding_ms: this.prefixPaddingMs,
-          silence_duration_ms: this.silenceDurationMs,
         },
       },
     });
@@ -281,7 +319,7 @@ export class Transcriber {
       return;
     }
 
-    if (itemId) this.emittedItemIds.add(itemId);
+    this.markItemEmitted(itemId);
     this.cb.onFinalTranscript(transcript);
   }
 
@@ -299,8 +337,8 @@ export class Transcriber {
   }
 
   private flushCommittedResults(): void {
-    while (this.committedItemOrder.length > 0) {
-      const nextItem = this.committedItemOrder[0];
+    while (this.committedItemHead < this.committedItemOrder.length) {
+      const nextItem = this.committedItemOrder[this.committedItemHead];
       if (!nextItem) break;
 
       const failed = this.failedByItem.get(nextItem);
@@ -308,8 +346,8 @@ export class Transcriber {
         this.failedByItem.delete(nextItem);
         this.completedByItem.delete(nextItem);
         this.committedItems.delete(nextItem);
-        this.emittedItemIds.add(nextItem);
-        this.committedItemOrder.shift();
+        this.markItemEmitted(nextItem);
+        this.committedItemHead += 1;
         this.cb.onError(new Error(failed));
         continue;
       }
@@ -319,33 +357,59 @@ export class Transcriber {
 
       this.completedByItem.delete(nextItem);
       this.committedItems.delete(nextItem);
-      this.emittedItemIds.add(nextItem);
-      this.committedItemOrder.shift();
+      this.markItemEmitted(nextItem);
+      this.committedItemHead += 1;
       this.cb.onFinalTranscript(transcript);
+    }
+
+    if (this.committedItemHead > 0 && this.committedItemHead * 2 >= this.committedItemOrder.length) {
+      this.committedItemOrder = this.committedItemOrder.slice(this.committedItemHead);
+      this.committedItemHead = 0;
     }
   }
 
   private flushPendingAudio(): void {
-    while (this.sessionReady && this.ws && this.ws.readyState === WebSocket.OPEN && this.pendingAudioChunks.length > 0) {
-      const chunk = this.pendingAudioChunks.shift();
-      if (chunk) {
-        this.send({ type: 'input_audio_buffer.append', audio: chunk });
-      }
+    if (!this.sessionReady || !this.ws || this.ws.readyState !== WebSocket.OPEN || this.pendingAudioChunks.length === 0) {
+      return;
+    }
+
+    const queuedChunks = this.pendingAudioChunks;
+    this.pendingAudioChunks = [];
+    for (const chunk of queuedChunks) {
+      this.sendAudioChunk(chunk);
     }
   }
 
   private handleErrorEvent(event: Record<string, unknown>): void {
     const message = getErrorMessage(event);
-    const lower = message.toLowerCase();
+    this.cb.onError(new Error(message));
+  }
 
-    if (!this.attemptedLegacyUpdate && (lower.includes('session.update') || lower.includes('audio.input'))) {
-      this.attemptedLegacyUpdate = true;
-      this.sessionReady = false;
-      this.sendLegacySessionUpdate();
-      return;
+  private markItemEmitted(itemId: string): void {
+    if (!itemId || this.emittedItemIds.has(itemId)) return;
+
+    this.emittedItemIds.add(itemId);
+    this.emittedItemOrder.push(itemId);
+
+    const trackedCount = this.emittedItemOrder.length - this.emittedItemHead;
+    if (trackedCount <= Transcriber.MAX_TRACKED_EMITTED_ITEMS) return;
+
+    const overflow = trackedCount - Transcriber.MAX_TRACKED_EMITTED_ITEMS;
+    for (let i = 0; i < overflow; i += 1) {
+      const staleId = this.emittedItemOrder[this.emittedItemHead];
+      this.emittedItemHead += 1;
+      if (staleId) this.emittedItemIds.delete(staleId);
     }
 
-    this.cb.onError(new Error(message));
+    if (this.emittedItemHead * 2 >= this.emittedItemOrder.length) {
+      this.emittedItemOrder = this.emittedItemOrder.slice(this.emittedItemHead);
+      this.emittedItemHead = 0;
+    }
+  }
+
+  private sendAudioChunk(base64: string): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(Transcriber.AUDIO_APPEND_PREFIX + base64 + Transcriber.AUDIO_APPEND_SUFFIX);
   }
 
   private send(msg: Record<string, unknown>): void {

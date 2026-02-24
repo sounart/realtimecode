@@ -28,9 +28,129 @@ function parsePayload(payload: string): Record<string, unknown> {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllEnvs();
 });
 
 describe('Transcriber', () => {
+  it('uses GA websocket defaults with model query and no beta header', () => {
+    let capturedUrl = '';
+    let capturedOptions: object | undefined;
+    const socketFactory = (url: string, options?: object) => {
+      capturedUrl = url;
+      capturedOptions = options;
+      return new FakeSocket() as unknown as WebSocket;
+    };
+
+    const transcriber = new Transcriber(
+      { apiKey: 'test', socketFactory },
+      {
+        onPartialTranscript: vi.fn(),
+        onFinalTranscript: vi.fn(),
+        onError: vi.fn(),
+        onReady: vi.fn(),
+      },
+    );
+
+    transcriber.connect();
+
+    expect(capturedUrl).toBe('wss://api.openai.com/v1/realtime?model=gpt-4o-transcribe');
+    expect(capturedOptions).toEqual({
+      headers: {
+        Authorization: 'Bearer test',
+      },
+    });
+  });
+
+  it('supports env-configured transcription model and language', () => {
+    vi.stubEnv('RTC_TRANSCRIBE_MODEL', 'gpt-4o-mini-transcribe');
+    vi.stubEnv('RTC_TRANSCRIBE_LANGUAGE', 'en');
+
+    const sockets: FakeSocket[] = [];
+    let capturedUrl = '';
+    const socketFactory = (url: string) => {
+      capturedUrl = url;
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket as unknown as WebSocket;
+    };
+
+    const transcriber = new Transcriber(
+      { apiKey: 'test', socketFactory },
+      {
+        onPartialTranscript: vi.fn(),
+        onFinalTranscript: vi.fn(),
+        onError: vi.fn(),
+        onReady: vi.fn(),
+      },
+    );
+
+    transcriber.connect();
+    const socket = sockets[0];
+    socket.readyState = FakeSocket.OPEN;
+    socket.emit('open');
+
+    expect(capturedUrl).toBe('wss://api.openai.com/v1/realtime?model=gpt-4o-mini-transcribe');
+    const update = parsePayload(socket.sent[0]);
+    expect(update.type).toBe('session.update');
+    expect(update.session).toMatchObject({
+      audio: {
+        input: {
+          transcription: {
+            model: 'gpt-4o-mini-transcribe',
+            language: 'en',
+          },
+        },
+      },
+    });
+  });
+
+  it('blocks custom realtime URLs unless explicitly allowed', () => {
+    vi.stubEnv('RTC_REALTIME_URL', 'wss://example.com/v1/realtime');
+
+    let capturedUrl = '';
+    const socketFactory = (url: string) => {
+      capturedUrl = url;
+      return new FakeSocket() as unknown as WebSocket;
+    };
+
+    const transcriber = new Transcriber(
+      { apiKey: 'test', socketFactory },
+      {
+        onPartialTranscript: vi.fn(),
+        onFinalTranscript: vi.fn(),
+        onError: vi.fn(),
+        onReady: vi.fn(),
+      },
+    );
+
+    transcriber.connect();
+    expect(capturedUrl).toBe('wss://api.openai.com/v1/realtime?model=gpt-4o-transcribe');
+  });
+
+  it('allows custom realtime URLs when RTC_ALLOW_CUSTOM_REALTIME_URL=1', () => {
+    vi.stubEnv('RTC_REALTIME_URL', 'wss://example.com/v1/realtime');
+    vi.stubEnv('RTC_ALLOW_CUSTOM_REALTIME_URL', '1');
+
+    let capturedUrl = '';
+    const socketFactory = (url: string) => {
+      capturedUrl = url;
+      return new FakeSocket() as unknown as WebSocket;
+    };
+
+    const transcriber = new Transcriber(
+      { apiKey: 'test', socketFactory },
+      {
+        onPartialTranscript: vi.fn(),
+        onFinalTranscript: vi.fn(),
+        onError: vi.fn(),
+        onReady: vi.fn(),
+      },
+    );
+
+    transcriber.connect();
+    expect(capturedUrl).toBe('wss://example.com/v1/realtime');
+  });
+
   it('buffers early audio and flushes after session update', () => {
     const sockets: FakeSocket[] = [];
     const socketFactory = () => {
@@ -78,7 +198,7 @@ describe('Transcriber', () => {
     expect(onError).not.toHaveBeenCalled();
   });
 
-  it('falls back to legacy transcription_session.update when session.update is rejected', () => {
+  it('forwards server errors instead of sending legacy beta updates', () => {
     const sockets: FakeSocket[] = [];
     const socketFactory = () => {
       const socket = new FakeSocket();
@@ -86,12 +206,13 @@ describe('Transcriber', () => {
       return socket as unknown as WebSocket;
     };
 
+    const onError = vi.fn();
     const transcriber = new Transcriber(
       { apiKey: 'test', socketFactory },
       {
         onPartialTranscript: vi.fn(),
         onFinalTranscript: vi.fn(),
-        onError: vi.fn(),
+        onError,
         onReady: vi.fn(),
       },
     );
@@ -105,8 +226,10 @@ describe('Transcriber', () => {
 
     socket.emit('message', JSON.stringify({ type: 'error', message: 'Unknown event type: session.update' }));
 
-    expect(socket.sent).toHaveLength(2);
-    expect(parsePayload(socket.sent[1]).type).toBe('transcription_session.update');
+    expect(socket.sent).toHaveLength(1);
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'Unknown event type: session.update' }),
+    );
   });
 
   it('emits final transcripts in commit order when completion events arrive out of order', () => {

@@ -2,6 +2,7 @@ import net from 'node:net';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import type { SessionState, JsonRpcRequest, JsonRpcResponse, JsonRpcNotification } from './types.js';
 import { Transcriber } from './transcriber.js';
 import { CodexRunner } from './codex.js';
@@ -10,21 +11,72 @@ import { getLogPath, logger } from './logger.js';
 
 const SOCKET_PATH = process.env['RTC_SOCKET_PATH']
   ?? path.join(os.homedir(), '.runtime', 'realtimecode', 'orchestrator.sock');
+const SOCKET_DIR = path.dirname(SOCKET_PATH);
+const AUTH_REQUIRED = process.env['RTC_AUTH_REQUIRED'] !== '0';
+const AUTH_TOKEN_PATH = process.env['RTC_AUTH_TOKEN_PATH']
+  ?? path.join(SOCKET_DIR, 'orchestrator.token');
+const MAX_RPC_LINE_BYTES = parseBoundedInt(
+  process.env['RTC_MAX_RPC_LINE_BYTES'],
+  1_048_576,
+  8_192,
+  8_388_608,
+);
+const MAX_AUDIO_CHUNK_BASE64_CHARS = parseBoundedInt(
+  process.env['RTC_MAX_AUDIO_CHUNK_BASE64_CHARS'],
+  256_000,
+  4_096,
+  2_000_000,
+);
+const LOG_INSTRUCTION_PREVIEW = process.env['RTC_LOG_INSTRUCTION_PREVIEW'] === '1';
 
 let state: SessionState = 'idle';
 let workdir: string | null = null;
 let transcriber: Transcriber | null = null;
 const codex = new CodexRunner();
 const connectedSockets = new Set<net.Socket>();
+const authenticatedSockets = new Set<net.Socket>();
 let activeServer: net.Server | null = null;
 let shuttingDown = false;
+let authToken: string | null = null;
+
+function parseBoundedInt(
+  raw: string | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return fallback;
+  const intVal = Math.floor(parsed);
+  if (intVal < min || intVal > max) return fallback;
+  return intVal;
+}
+
+function isSocketAuthenticated(socket: net.Socket): boolean {
+  return !AUTH_REQUIRED || authenticatedSockets.has(socket);
+}
+
+function sendNotification(
+  socket: net.Socket,
+  method: string,
+  params: Record<string, unknown>,
+): void {
+  const msg: JsonRpcNotification = { jsonrpc: '2.0', method, params };
+  socket.write(JSON.stringify(msg) + '\n');
+}
+
+function sendStatus(socket: net.Socket): void {
+  sendNotification(socket, 'status', { state });
+}
 
 // --- Broadcast helpers ---
 
 function notify(method: string, params: Record<string, unknown>): void {
-  const msg: JsonRpcNotification = { jsonrpc: '2.0', method, params };
-  const line = JSON.stringify(msg) + '\n';
-  for (const s of connectedSockets) s.write(line);
+  for (const s of connectedSockets) {
+    if (!isSocketAuthenticated(s)) continue;
+    sendNotification(s, method, params);
+  }
 }
 
 function broadcastStatus(): void {
@@ -39,10 +91,10 @@ function broadcastError(message: string): void {
 
 function setState(next: SessionState): void {
   const prev = state;
+  if (prev === next) return;
+
   state = next;
-  if (prev !== next) {
-    logger.info('state changed', { from: prev, to: next });
-  }
+  logger.info('state changed', { from: prev, to: next });
   broadcastStatus();
 }
 
@@ -95,10 +147,13 @@ function executeInstruction(text: string): void {
   if (!workdir) return;
 
   const normalized = text.replace(/\s+/g, ' ').trim();
-  logger.info('executing instruction', {
+  const meta: Record<string, unknown> = {
     chars: text.length,
-    preview: normalized.slice(0, 200),
-  });
+  };
+  if (LOG_INSTRUCTION_PREVIEW) {
+    meta['preview'] = normalized.slice(0, 200);
+  }
+  logger.info('executing instruction', meta);
 
   setState('executing');
 
@@ -142,10 +197,41 @@ function stopAll(): void {
 
 // --- RPC handling ---
 
-function handleRequest(req: JsonRpcRequest): JsonRpcResponse | null {
+function safeTokenEquals(actual: string, expected: string): boolean {
+  const actualBuf = Buffer.from(actual);
+  const expectedBuf = Buffer.from(expected);
+  if (actualBuf.length !== expectedBuf.length) return false;
+  return timingSafeEqual(actualBuf, expectedBuf);
+}
+
+function handleRequest(req: JsonRpcRequest, socket: net.Socket): JsonRpcResponse | null {
   const id = req.id ?? null;
 
+  if (AUTH_REQUIRED && !authenticatedSockets.has(socket)) {
+    if (req.method !== 'auth') {
+      return id != null
+        ? { jsonrpc: '2.0', id, error: { code: -32001, message: 'Unauthorized: call auth first' } }
+        : null;
+    }
+
+    const params = req.params as { token?: string } | undefined;
+    const presentedToken = params?.token;
+    if (typeof presentedToken !== 'string' || !presentedToken || !authToken || !safeTokenEquals(presentedToken, authToken)) {
+      logger.warn('socket auth rejected');
+      return id != null
+        ? { jsonrpc: '2.0', id, error: { code: -32001, message: 'Unauthorized: invalid token' } }
+        : null;
+    }
+
+    authenticatedSockets.add(socket);
+    logger.info('socket authenticated');
+    sendStatus(socket);
+    return id != null ? { jsonrpc: '2.0', id, result: { ok: true } } : null;
+  }
+
   switch (req.method) {
+    case 'auth':
+      return id != null ? { jsonrpc: '2.0', id, result: { ok: true } } : null;
     case 'start': {
       const params = req.params as { workdir?: string } | undefined;
       const dir = params?.workdir;
@@ -172,8 +258,22 @@ function handleRequest(req: JsonRpcRequest): JsonRpcResponse | null {
     }
     case 'audio': {
       const params = req.params as { chunk?: string } | undefined;
-      if (typeof params?.chunk === 'string' && params.chunk && transcriber) {
-        transcriber.sendAudio(params.chunk);
+      if (typeof params?.chunk === 'string' && params.chunk) {
+        if (params.chunk.length > MAX_AUDIO_CHUNK_BASE64_CHARS) {
+          logger.warn('audio chunk rejected: too large', {
+            chars: params.chunk.length,
+            maxChars: MAX_AUDIO_CHUNK_BASE64_CHARS,
+          });
+          const errMessage = 'Audio chunk too large';
+          broadcastError(errMessage);
+          return id != null
+            ? { jsonrpc: '2.0', id, error: { code: -32602, message: errMessage } }
+            : null;
+        }
+
+        if (transcriber) {
+          transcriber.sendAudio(params.chunk);
+        }
       }
       // Notification — only respond if id present
       return id != null ? { jsonrpc: '2.0', id, result: { ok: true } } : null;
@@ -197,10 +297,57 @@ function parseRequest(line: string): JsonRpcRequest | null {
 
 async function removeStaleSocket(sockPath: string): Promise<void> {
   try {
+    const stats = await fs.lstat(sockPath);
+    if (!stats.isSocket()) return;
     await fs.unlink(sockPath);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
   }
+}
+
+async function readAuthTokenFromDisk(tokenPath: string): Promise<string | null> {
+  try {
+    const token = (await fs.readFile(tokenPath, 'utf8')).trim();
+    if (token.length >= 16) return token;
+    return null;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
+async function resolveAuthToken(): Promise<string | null> {
+  if (!AUTH_REQUIRED) return null;
+
+  const envToken = process.env['RTC_AUTH_TOKEN']?.trim();
+  if (envToken && envToken.length >= 16) return envToken;
+
+  await fs.mkdir(SOCKET_DIR, { recursive: true, mode: 0o700 });
+  await fs.chmod(SOCKET_DIR, 0o700).catch(() => {
+    logger.warn('failed to enforce socket directory permissions', { socketDir: SOCKET_DIR });
+  });
+
+  const existing = await readAuthTokenFromDisk(AUTH_TOKEN_PATH);
+  if (existing) return existing;
+
+  const generated = randomBytes(32).toString('hex');
+  try {
+    await fs.writeFile(AUTH_TOKEN_PATH, `${generated}\n`, { mode: 0o600, flag: 'wx' });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+      const raced = await readAuthTokenFromDisk(AUTH_TOKEN_PATH);
+      if (raced) return raced;
+      await fs.writeFile(AUTH_TOKEN_PATH, `${generated}\n`, { mode: 0o600 });
+    } else {
+      throw err;
+    }
+  }
+
+  await fs.chmod(AUTH_TOKEN_PATH, 0o600).catch(() => {
+    logger.warn('failed to enforce auth token file permissions', { authTokenPath: AUTH_TOKEN_PATH });
+  });
+
+  return generated;
 }
 
 async function ensureSocketPathAvailable(sockPath: string): Promise<void> {
@@ -269,21 +416,43 @@ async function shutdown(code = 0): Promise<void> {
 }
 
 async function startServer(): Promise<void> {
-  await fs.mkdir(path.dirname(SOCKET_PATH), { recursive: true });
+  await fs.mkdir(SOCKET_DIR, { recursive: true, mode: 0o700 });
+  await fs.chmod(SOCKET_DIR, 0o700).catch(() => {
+    logger.warn('failed to enforce socket directory permissions', { socketDir: SOCKET_DIR });
+  });
+
+  authToken = await resolveAuthToken();
+  if (AUTH_REQUIRED && !authToken) {
+    throw new Error('IPC authentication is enabled but no auth token is available');
+  }
   await ensureSocketPathAvailable(SOCKET_PATH);
 
   const server = net.createServer((socket) => {
     socket.setEncoding('utf8');
     connectedSockets.add(socket);
 
-    // Send current state on connect
-    const status: JsonRpcNotification = { jsonrpc: '2.0', method: 'status', params: { state } };
-    socket.write(JSON.stringify(status) + '\n');
+    if (!AUTH_REQUIRED) {
+      sendStatus(socket);
+    }
 
     let buffer = '';
 
     socket.on('data', (chunk: string) => {
       buffer += chunk;
+      if (buffer.length > MAX_RPC_LINE_BYTES) {
+        logger.warn('socket input exceeded max line length; closing client', {
+          maxLineBytes: MAX_RPC_LINE_BYTES,
+        });
+        const response: JsonRpcResponse = {
+          jsonrpc: '2.0',
+          id: null,
+          error: { code: -32600, message: 'RPC line too long' },
+        };
+        socket.write(JSON.stringify(response) + '\n');
+        socket.destroy();
+        return;
+      }
+
       let nl = buffer.indexOf('\n');
       while (nl >= 0) {
         const line = buffer.slice(0, nl).trim();
@@ -295,7 +464,7 @@ async function startServer(): Promise<void> {
 
           try {
             response = req
-              ? handleRequest(req)
+              ? handleRequest(req, socket)
               : { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } };
           } catch (err) {
             logger.error('request handler error', {
@@ -311,9 +480,13 @@ async function startServer(): Promise<void> {
       }
     });
 
-    socket.on('close', () => connectedSockets.delete(socket));
+    socket.on('close', () => {
+      connectedSockets.delete(socket);
+      authenticatedSockets.delete(socket);
+    });
     socket.on('error', (err) => {
       connectedSockets.delete(socket);
+      authenticatedSockets.delete(socket);
       logger.error('socket error', { message: err.message });
     });
   });
@@ -321,10 +494,16 @@ async function startServer(): Promise<void> {
   activeServer = server;
 
   server.listen(SOCKET_PATH, () => {
+    void fs.chmod(SOCKET_PATH, 0o600).catch(() => {
+      logger.warn('failed to enforce socket file permissions', { socketPath: SOCKET_PATH });
+    });
     logger.info('orchestrator listening', {
       socketPath: SOCKET_PATH,
       logPath: getLogPath(),
       pid: process.pid,
+      authRequired: AUTH_REQUIRED,
+      authTokenPath: AUTH_REQUIRED ? AUTH_TOKEN_PATH : null,
+      maxRpcLineBytes: MAX_RPC_LINE_BYTES,
     });
   });
 

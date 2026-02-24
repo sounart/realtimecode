@@ -27,7 +27,14 @@ enum OrchestratorEvent {
 /// IPC client for the orchestrator daemon via Unix domain socket.
 /// Speaks newline-delimited JSON-RPC 2.0.
 final class OrchestratorClient {
+    private static let audioNotificationPrefix = Data("{\"jsonrpc\":\"2.0\",\"method\":\"audio\",\"params\":{\"chunk\":\"".utf8)
+    private static let audioNotificationSuffix = Data("\"}}\n".utf8)
+    private static let maxIncomingBufferBytes = 1_048_576
+    private static let maxAudioChunkBase64Chars = 256_000
+
     private let socketPath: String
+    private let authTokenPath: String
+    private let authToken: String
     private var socketFd: Int32 = -1
     private var readSource: DispatchSourceRead?
     private var readBuffer = Data()
@@ -47,9 +54,16 @@ final class OrchestratorClient {
 
     init(socketPath: String? = nil) {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let runtimeDir = "\(home)/.runtime/realtimecode"
         self.socketPath = socketPath
             ?? ProcessInfo.processInfo.environment["RTC_SOCKET_PATH"]
-            ?? "\(home)/.runtime/realtimecode/orchestrator.sock"
+            ?? "\(runtimeDir)/orchestrator.sock"
+        self.authTokenPath = ProcessInfo.processInfo.environment["RTC_AUTH_TOKEN_PATH"]
+            ?? "\(runtimeDir)/orchestrator.token"
+        self.authToken = Self.resolveAuthToken(
+            explicitToken: ProcessInfo.processInfo.environment["RTC_AUTH_TOKEN"],
+            tokenPath: self.authTokenPath
+        )
     }
 
     // MARK: - Backend Spawning
@@ -59,20 +73,24 @@ final class OrchestratorClient {
             return
         }
 
-        let proc = Process()
-        // Look for npx in common locations
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        proc.arguments = ["npx", "tsx", "src/server.ts"]
-
         // Resolve orchestrator directory relative to the app bundle or a known location
         let orchestratorDir = ProcessInfo.processInfo.environment["RTC_ORCHESTRATOR_DIR"]
             ?? findOrchestratorDir()
-        proc.currentDirectoryURL = URL(fileURLWithPath: orchestratorDir)
 
-        // Pass through environment (especially OPENAI_API_KEY, PATH)
-        var env = ProcessInfo.processInfo.environment
-        env["NODE_NO_WARNINGS"] = "1"
-        proc.environment = env
+        guard let nodePath = resolveNodeExecutable() else {
+            print("[OrchestratorClient] Failed to spawn backend: could not find a Node executable")
+            return
+        }
+        guard let tsxCliPath = resolveTsxCliPath(orchestratorDir: orchestratorDir) else {
+            print("[OrchestratorClient] Failed to spawn backend: could not find tsx CLI in node_modules")
+            return
+        }
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: nodePath)
+        proc.arguments = [tsxCliPath, "src/server.ts"]
+        proc.currentDirectoryURL = URL(fileURLWithPath: orchestratorDir)
+        proc.environment = buildBackendEnvironment()
 
         proc.standardOutput = FileHandle.nullDevice
         proc.standardError = FileHandle.nullDevice
@@ -115,6 +133,7 @@ final class OrchestratorClient {
         guard FileManager.default.fileExists(atPath: socketPath) else { return }
         guard case .connectionFailed(code: let code, message: _) = (error as? OrchestratorError) else { return }
         guard code == ECONNREFUSED else { return }
+        guard isSocketFile(atPath: socketPath) else { return }
         try? FileManager.default.removeItem(atPath: socketPath)
     }
 
@@ -138,6 +157,107 @@ final class OrchestratorClient {
             }
         }
         return candidates[0]
+    }
+
+    private func resolveNodeExecutable() -> String? {
+        let env = ProcessInfo.processInfo.environment
+        let candidates = [
+            env["RTC_NODE_PATH"],
+            "/opt/homebrew/bin/node",
+            "/usr/local/bin/node",
+            "/usr/bin/node",
+        ].compactMap { $0 }
+
+        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
+            return path
+        }
+        return nil
+    }
+
+    private func resolveTsxCliPath(orchestratorDir: String) -> String? {
+        let rootTsx = URL(fileURLWithPath: orchestratorDir)
+            .appendingPathComponent("../../node_modules/tsx/dist/cli.mjs")
+            .standardizedFileURL.path
+        let localTsx = URL(fileURLWithPath: orchestratorDir)
+            .appendingPathComponent("node_modules/tsx/dist/cli.mjs")
+            .standardizedFileURL.path
+
+        for path in [rootTsx, localTsx] where FileManager.default.fileExists(atPath: path) {
+            return path
+        }
+        return nil
+    }
+
+    private func buildBackendEnvironment() -> [String: String] {
+        let inherited = ProcessInfo.processInfo.environment
+        var env: [String: String] = [:]
+
+        for key in ["HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "SHELL", "USER", "LOGNAME"] {
+            if let value = inherited[key], !value.isEmpty {
+                env[key] = value
+            }
+        }
+        env["PATH"] = sanitizePath(inherited["PATH"])
+
+        let allowlist = [
+            "OPENAI_API_KEY",
+            "CODEX_COMMAND",
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "NO_PROXY",
+            "RTC_SOCKET_PATH",
+            "RTC_LOG_PATH",
+            "RTC_LOG_STDOUT",
+            "RTC_LOG_FILE",
+            "RTC_CODEX_TIMEOUT_MS",
+            "RTC_CODEX_KILL_GRACE_MS",
+            "RTC_CODEX_EPHEMERAL",
+            "RTC_CODEX_SKIP_GIT_REPO_CHECK",
+            "RTC_REALTIME_URL",
+            "RTC_ALLOW_CUSTOM_REALTIME_URL",
+            "RTC_TRANSCRIBE_MODEL",
+            "RTC_TRANSCRIBE_LANGUAGE",
+            "RTC_MAX_RPC_LINE_BYTES",
+            "RTC_MAX_AUDIO_CHUNK_BASE64_CHARS",
+            "RTC_LOG_INSTRUCTION_PREVIEW",
+        ]
+        for key in allowlist {
+            if let value = inherited[key], !value.isEmpty {
+                env[key] = value
+            }
+        }
+
+        env["RTC_AUTH_REQUIRED"] = inherited["RTC_AUTH_REQUIRED"] ?? "1"
+        env["RTC_AUTH_TOKEN_PATH"] = authTokenPath
+        env["RTC_AUTH_TOKEN"] = authToken
+        env["NODE_NO_WARNINGS"] = "1"
+        return env
+    }
+
+    private func sanitizePath(_ rawPath: String?) -> String {
+        let fallback = ["/usr/bin", "/bin", "/usr/sbin", "/sbin", "/opt/homebrew/bin", "/usr/local/bin"]
+        let sourceParts = (rawPath ?? "").split(separator: ":").map(String.init)
+        var seen = Set<String>()
+        var result: [String] = []
+
+        for part in sourceParts {
+            guard part.hasPrefix("/") else { continue }
+            if seen.insert(part).inserted {
+                result.append(part)
+            }
+        }
+        for part in fallback where seen.insert(part).inserted {
+            result.append(part)
+        }
+        return result.joined(separator: ":")
+    }
+
+    private func isSocketFile(atPath path: String) -> Bool {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let fileType = attrs[.type] as? FileAttributeType else {
+            return false
+        }
+        return fileType == .typeSocket
     }
 
     // MARK: - Connection
@@ -189,6 +309,7 @@ final class OrchestratorClient {
 
         isConnected = true
         startReading()
+        authenticate()
     }
 
     /// Spawn backend if needed, then connect with retries.
@@ -267,15 +388,41 @@ final class OrchestratorClient {
 
     /// Stream an audio chunk (base64-encoded PCM16 24kHz mono).
     func streamAudio(base64Chunk: String) {
-        let notification: [String: Any] = [
-            "jsonrpc": "2.0",
-            "method": "audio",
-            "params": ["chunk": base64Chunk]
-        ]
-        sendJSON(notification)
+        guard base64Chunk.utf8.count <= Self.maxAudioChunkBase64Chars else {
+            onEvent?(.error(message: "Audio chunk too large; dropped"))
+            return
+        }
+        guard isConnected else { return }
+        queue.async { [weak self] in
+            guard let self = self, self.isConnected else { return }
+            self.sendAudioNotification(base64Chunk)
+        }
     }
 
     // MARK: - Internal
+
+    private func authenticate() {
+        let id = nextId()
+        sendRequest(id: id, method: "auth", params: ["token": authToken])
+    }
+
+    private static func resolveAuthToken(explicitToken: String?, tokenPath: String) -> String {
+        if let explicitToken {
+            let trimmed = explicitToken.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.count >= 16 {
+                return trimmed
+            }
+        }
+
+        if let fileToken = try? String(contentsOfFile: tokenPath, encoding: .utf8) {
+            let trimmed = fileToken.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.count >= 16 {
+                return trimmed
+            }
+        }
+
+        return UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+    }
 
     private func nextId() -> Int {
         let id = nextRequestId
@@ -306,6 +453,19 @@ final class OrchestratorClient {
             guard let lineData = line.data(using: .utf8) else { return }
             self.writeLineData(lineData)
         }
+    }
+
+    private func sendAudioNotification(_ base64Chunk: String) {
+        // Base64 only contains JSON-safe characters, so this avoids per-chunk JSONSerialization overhead.
+        var lineData = Data(
+            capacity: Self.audioNotificationPrefix.count
+                + base64Chunk.utf8.count
+                + Self.audioNotificationSuffix.count
+        )
+        lineData.append(Self.audioNotificationPrefix)
+        lineData.append(contentsOf: base64Chunk.utf8)
+        lineData.append(Self.audioNotificationSuffix)
+        writeLineData(lineData)
     }
 
     private func writeLineData(_ lineData: Data, from initialOffset: Int = 0) {
@@ -361,6 +521,14 @@ final class OrchestratorClient {
             }
 
             self.readBuffer.append(contentsOf: buf[0..<bytesRead])
+            if self.readBuffer.count > Self.maxIncomingBufferBytes {
+                self.readBuffer.removeAll(keepingCapacity: false)
+                DispatchQueue.main.async {
+                    self.onEvent?(.error(message: "Backend message exceeded size limit"))
+                    self.handleDisconnect()
+                }
+                return
+            }
             self.processReadBuffer()
         }
 
