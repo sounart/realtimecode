@@ -3,13 +3,13 @@ import Foundation
 
 /// Errors from the orchestrator IPC connection.
 enum OrchestratorError: Error, LocalizedError {
-    case connectionFailed(String)
+    case connectionFailed(code: Int32, message: String)
     case notConnected
     case sendFailed(String)
 
     var errorDescription: String? {
         switch self {
-        case .connectionFailed(let msg): return "Connection failed: \(msg)"
+        case .connectionFailed(_, let message): return "Connection failed: \(message)"
         case .notConnected: return "Not connected to orchestrator"
         case .sendFailed(let msg): return "Send failed: \(msg)"
         }
@@ -34,6 +34,7 @@ final class OrchestratorClient {
     private var nextRequestId: Int = 1
     private let queue = DispatchQueue(label: "com.realtimecode.orchestrator-client")
     private var backendProcess: Process?
+    private var launchedBackend = false
     private var reconnectTimer: DispatchSourceTimer?
 
     private(set) var isConnected = false
@@ -53,13 +54,11 @@ final class OrchestratorClient {
 
     // MARK: - Backend Spawning
 
-    /// Ensures the Node.js backend is running. Spawns it if the socket doesn't exist.
-    func ensureBackend() {
-        if FileManager.default.fileExists(atPath: socketPath) { return }
-        spawnBackend()
-    }
-
     private func spawnBackend() {
+        if let existing = backendProcess, existing.isRunning {
+            return
+        }
+
         let proc = Process()
         // Look for npx in common locations
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
@@ -81,9 +80,48 @@ final class OrchestratorClient {
         do {
             try proc.run()
             backendProcess = proc
+            launchedBackend = true
+            proc.terminationHandler = { [weak self, weak proc] _ in
+                DispatchQueue.main.async {
+                    guard let self = self, let proc = proc else { return }
+                    guard self.backendProcess === proc else { return }
+                    self.backendProcess = nil
+                    self.launchedBackend = false
+                }
+            }
         } catch {
             print("[OrchestratorClient] Failed to spawn backend: \(error)")
         }
+    }
+
+    private func terminateLaunchedBackendIfNeeded() {
+        guard launchedBackend, let proc = backendProcess else { return }
+        guard proc.isRunning else {
+            backendProcess = nil
+            launchedBackend = false
+            return
+        }
+        proc.terminate()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1.0) { [weak self, weak proc] in
+            guard let self = self, let proc = proc else { return }
+            DispatchQueue.main.async {
+                guard self.backendProcess === proc, self.launchedBackend, proc.isRunning else { return }
+                _ = Darwin.kill(proc.processIdentifier, SIGKILL)
+            }
+        }
+    }
+
+    private func removeStaleSocketIfNeeded(after error: Error) {
+        guard FileManager.default.fileExists(atPath: socketPath) else { return }
+        guard case .connectionFailed(code: let code, message: _) = (error as? OrchestratorError) else { return }
+        guard code == ECONNREFUSED else { return }
+        try? FileManager.default.removeItem(atPath: socketPath)
+    }
+
+    private func shouldRespawnBackend(spawnedOnce: Bool) -> Bool {
+        if !spawnedOnce { return true }
+        guard let proc = backendProcess else { return true }
+        return !proc.isRunning
     }
 
     private func findOrchestratorDir() -> String {
@@ -109,7 +147,10 @@ final class OrchestratorClient {
 
         socketFd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard socketFd >= 0 else {
-            throw OrchestratorError.connectionFailed("socket() failed: \(String(cString: strerror(errno)))")
+            throw OrchestratorError.connectionFailed(
+                code: errno,
+                message: "socket() failed: \(String(cString: strerror(errno)))"
+            )
         }
 
         var addr = sockaddr_un()
@@ -118,7 +159,7 @@ final class OrchestratorClient {
         guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else {
             close(socketFd)
             socketFd = -1
-            throw OrchestratorError.connectionFailed("Socket path too long")
+            throw OrchestratorError.connectionFailed(code: ENAMETOOLONG, message: "Socket path too long")
         }
         withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
             ptr.withMemoryRebound(to: CChar.self, capacity: pathBytes.count) { dest in
@@ -135,10 +176,11 @@ final class OrchestratorClient {
         }
 
         guard connectResult == 0 else {
-            let errMsg = String(cString: strerror(errno))
+            let errCode = errno
+            let errMsg = String(cString: strerror(errCode))
             close(socketFd)
             socketFd = -1
-            throw OrchestratorError.connectionFailed(errMsg)
+            throw OrchestratorError.connectionFailed(code: errCode, message: errMsg)
         }
 
         // Set non-blocking
@@ -150,10 +192,17 @@ final class OrchestratorClient {
     }
 
     /// Spawn backend if needed, then connect with retries.
-    func connectWithSpawn(retries: Int = 10, delay: TimeInterval = 0.5) {
-        ensureBackend()
+    func connectWithSpawn(
+        retries: Int = 10,
+        delay: TimeInterval = 0.5,
+        onConnected: (() -> Void)? = nil,
+        onFailure: ((String) -> Void)? = nil
+    ) {
+        reconnectTimer?.cancel()
+        reconnectTimer = nil
 
         var attempts = 0
+        var spawned = false
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now(), repeating: delay)
         timer.setEventHandler { [weak self] in
@@ -164,11 +213,19 @@ final class OrchestratorClient {
                 try self.connect()
                 timer.cancel()
                 self.reconnectTimer = nil
+                onConnected?()
             } catch {
+                if self.shouldRespawnBackend(spawnedOnce: spawned) {
+                    self.removeStaleSocketIfNeeded(after: error)
+                    self.spawnBackend()
+                    spawned = true
+                }
                 if attempts >= retries {
                     timer.cancel()
                     self.reconnectTimer = nil
-                    self.onEvent?(.error(message: "Failed to connect to backend after \(retries) attempts"))
+                    let message = "Failed to connect to backend after \(retries) attempts"
+                    self.onEvent?(.error(message: message))
+                    onFailure?(message)
                 }
             }
         }
@@ -177,15 +234,21 @@ final class OrchestratorClient {
     }
 
     func disconnect() {
-        guard isConnected else { return }
         reconnectTimer?.cancel()
         reconnectTimer = nil
-        readSource?.cancel()
-        readSource = nil
-        close(socketFd)
-        socketFd = -1
+
+        if readSource != nil {
+            readSource?.cancel()
+            readSource = nil
+        }
+        if socketFd >= 0 {
+            close(socketFd)
+            socketFd = -1
+        }
+
         isConnected = false
         readBuffer = Data()
+        terminateLaunchedBackendIfNeeded()
     }
 
     // MARK: - JSON-RPC Methods
@@ -241,27 +304,38 @@ final class OrchestratorClient {
 
             line.append("\n")
             guard let lineData = line.data(using: .utf8) else { return }
+            self.writeLineData(lineData)
+        }
+    }
 
-            lineData.withUnsafeBytes { ptr in
-                guard let baseAddress = ptr.baseAddress else { return }
-                var sent = 0
-                while sent < lineData.count {
-                    let result = write(self.socketFd, baseAddress + sent, lineData.count - sent)
-                    if result > 0 {
-                        sent += result
-                        continue
-                    }
-                    let err = errno
-                    if err == EINTR { continue }
-                    if err == EAGAIN || err == EWOULDBLOCK {
-                        usleep(1_000)
-                        continue
-                    }
-                    if result <= 0 {
-                        DispatchQueue.main.async { self.handleDisconnect() }
-                        return
-                    }
+    private func writeLineData(_ lineData: Data, from initialOffset: Int = 0) {
+        guard isConnected else { return }
+
+        lineData.withUnsafeBytes { ptr in
+            guard let baseAddress = ptr.baseAddress else { return }
+            var sent = initialOffset
+
+            while sent < lineData.count {
+                let result = write(self.socketFd, baseAddress + sent, lineData.count - sent)
+                if result > 0 {
+                    sent += result
+                    continue
                 }
+                let err = errno
+                if err == EINTR { continue }
+                if err == EAGAIN || err == EWOULDBLOCK {
+                    let nextOffset = sent
+                    queue.asyncAfter(deadline: .now() + .milliseconds(5)) { [weak self] in
+                        guard let self = self else { return }
+                        self.writeLineData(lineData, from: nextOffset)
+                    }
+                    return
+                }
+
+                DispatchQueue.main.async { [weak self] in
+                    self?.handleDisconnect()
+                }
+                return
             }
         }
     }

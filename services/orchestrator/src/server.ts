@@ -5,6 +5,8 @@ import os from 'node:os';
 import type { SessionState, JsonRpcRequest, JsonRpcResponse, JsonRpcNotification } from './types.js';
 import { Transcriber } from './transcriber.js';
 import { CodexRunner } from './codex.js';
+import { validateWorkdir } from './workdir.js';
+import { getLogPath, logger } from './logger.js';
 
 const SOCKET_PATH = process.env['RTC_SOCKET_PATH']
   ?? path.join(os.homedir(), '.runtime', 'realtimecode', 'orchestrator.sock');
@@ -36,18 +38,27 @@ function broadcastError(message: string): void {
 // --- State transitions ---
 
 function setState(next: SessionState): void {
+  const prev = state;
   state = next;
+  if (prev !== next) {
+    logger.info('state changed', { from: prev, to: next });
+  }
   broadcastStatus();
 }
 
-function startListening(dir: string): void {
+function startListening(dir: string): string | null {
   const apiKey = process.env['OPENAI_API_KEY'];
   if (!apiKey) {
-    broadcastError('OPENAI_API_KEY not set');
-    return;
+    logger.warn('start rejected: missing OPENAI_API_KEY');
+    return 'OPENAI_API_KEY not set';
   }
 
   workdir = dir;
+
+  if (transcriber) {
+    transcriber.disconnect();
+    transcriber = null;
+  }
 
   transcriber = new Transcriber({ apiKey }, {
     onPartialTranscript(text) {
@@ -58,20 +69,36 @@ function startListening(dir: string): void {
       executeInstruction(text);
     },
     onError(err) {
-      console.error('Transcriber error:', err.message);
+      logger.error('transcriber error', { message: err.message });
       broadcastError(err.message);
+
+      if (err.message.includes('reconnect attempts exhausted') && state === 'listening') {
+        if (transcriber) {
+          transcriber.disconnect();
+          transcriber = null;
+        }
+        workdir = null;
+        setState('idle');
+      }
     },
     onReady() {
-      console.log('Transcriber connected');
+      logger.info('transcriber connected');
     },
   });
 
   transcriber.connect();
   setState('listening');
+  return null;
 }
 
 function executeInstruction(text: string): void {
   if (!workdir) return;
+
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  logger.info('executing instruction', {
+    chars: text.length,
+    preview: normalized.slice(0, 200),
+  });
 
   setState('executing');
 
@@ -86,12 +113,14 @@ function executeInstruction(text: string): void {
       notify('codex', { type: 'output', data: { text: output } });
     },
     onDone() {
+      notify('codex', { type: 'done', data: {} });
+      logger.info('codex run completed');
       if (state === 'executing') {
         setState('listening');
       }
     },
     onError(err) {
-      console.error('Codex error:', err.message);
+      logger.error('codex run failed', { message: err.message });
       broadcastError(err.message);
       if (state === 'executing') {
         setState('listening');
@@ -101,6 +130,7 @@ function executeInstruction(text: string): void {
 }
 
 function stopAll(): void {
+  logger.info('stop requested');
   codex.cancel();
   if (transcriber) {
     transcriber.disconnect();
@@ -122,8 +152,18 @@ function handleRequest(req: JsonRpcRequest): JsonRpcResponse | null {
       if (typeof dir !== 'string' || !dir) {
         return { jsonrpc: '2.0', id, error: { code: -32602, message: 'Missing workdir param' } };
       }
+
+      const validation = validateWorkdir(dir);
+      if (validation.error || !validation.resolvedWorkdir) {
+        return { jsonrpc: '2.0', id, error: { code: -32602, message: validation.error ?? 'Invalid workdir' } };
+      }
+
       if (state !== 'idle') stopAll();
-      startListening(dir);
+      const startError = startListening(validation.resolvedWorkdir);
+      if (startError) {
+        broadcastError(startError);
+        return { jsonrpc: '2.0', id, error: { code: -32000, message: startError } };
+      }
       return { jsonrpc: '2.0', id, result: { ok: true } };
     }
     case 'stop': {
@@ -163,6 +203,54 @@ async function removeStaleSocket(sockPath: string): Promise<void> {
   }
 }
 
+async function ensureSocketPathAvailable(sockPath: string): Promise<void> {
+  try {
+    const stats = await fs.lstat(sockPath);
+    if (!stats.isSocket()) {
+      throw new Error(`Socket path exists but is not a socket: ${sockPath}`);
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw err;
+  }
+
+  const probeResult = await new Promise<'active' | 'stale'>((resolve, reject) => {
+    const probe = net.createConnection(sockPath);
+    const cleanup = () => {
+      probe.removeAllListeners();
+      probe.setTimeout(0);
+    };
+
+    probe.once('connect', () => {
+      cleanup();
+      probe.end();
+      resolve('active');
+    });
+
+    probe.once('error', (err: NodeJS.ErrnoException) => {
+      cleanup();
+      probe.destroy();
+      if (err.code === 'ECONNREFUSED' || err.code === 'ENOENT') {
+        resolve('stale');
+      } else {
+        reject(err);
+      }
+    });
+
+    probe.setTimeout(300, () => {
+      cleanup();
+      probe.destroy();
+      resolve('stale');
+    });
+  });
+
+  if (probeResult === 'active') {
+    throw new Error(`Socket already in use: ${sockPath}`);
+  }
+
+  await removeStaleSocket(sockPath);
+}
+
 async function shutdown(code = 0): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
@@ -176,13 +264,13 @@ async function shutdown(code = 0): Promise<void> {
   });
 
   await removeStaleSocket(SOCKET_PATH);
-  console.log('Orchestrator stopped');
+  logger.info('orchestrator stopped');
   process.exit(code);
 }
 
 async function startServer(): Promise<void> {
   await fs.mkdir(path.dirname(SOCKET_PATH), { recursive: true });
-  await removeStaleSocket(SOCKET_PATH);
+  await ensureSocketPathAvailable(SOCKET_PATH);
 
   const server = net.createServer((socket) => {
     socket.setEncoding('utf8');
@@ -210,7 +298,9 @@ async function startServer(): Promise<void> {
               ? handleRequest(req)
               : { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } };
           } catch (err) {
-            console.error('Request handler error:', err);
+            logger.error('request handler error', {
+              error: err instanceof Error ? err.message : String(err),
+            });
             response = { jsonrpc: '2.0', id: req?.id ?? null, error: { code: -32603, message: 'Internal error' } };
           }
 
@@ -224,25 +314,29 @@ async function startServer(): Promise<void> {
     socket.on('close', () => connectedSockets.delete(socket));
     socket.on('error', (err) => {
       connectedSockets.delete(socket);
-      console.error('Socket error:', err.message);
+      logger.error('socket error', { message: err.message });
     });
   });
 
   activeServer = server;
 
   server.listen(SOCKET_PATH, () => {
-    console.log(`Orchestrator listening on ${SOCKET_PATH}`);
+    logger.info('orchestrator listening', {
+      socketPath: SOCKET_PATH,
+      logPath: getLogPath(),
+      pid: process.pid,
+    });
   });
 
   for (const sig of ['SIGINT', 'SIGTERM'] as const) {
     process.on(sig, () => void shutdown(0));
   }
   process.on('uncaughtException', (err) => {
-    console.error('Uncaught exception:', err);
+    logger.error('uncaught exception', { message: err.message, stack: err.stack });
     void shutdown(1);
   });
   process.on('unhandledRejection', (err) => {
-    console.error('Unhandled rejection:', err);
+    logger.error('unhandled rejection', { error: String(err) });
     void shutdown(1);
   });
 }

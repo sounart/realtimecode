@@ -68,6 +68,11 @@ final class AppState: ObservableObject {
                 case "executing":
                     self.statusText = "Executing..."
                 case "idle":
+                    if self.isRecording {
+                        self.micService.stopCapture()
+                        self.isRecording = false
+                        self.currentTranscript = ""
+                    }
                     self.statusText = "Ready"
                 default:
                     self.statusText = state.capitalized
@@ -90,6 +95,11 @@ final class AppState: ObservableObject {
                     let path = data["path"] as? String ?? ""
                     let changeType = data["changeType"] as? String ?? "update"
                     self.lastAction = "\(changeType.capitalized) \(path)"
+                case "output":
+                    let text = data["text"] as? String ?? ""
+                    if let status = self.codexStatusLine(from: text) {
+                        self.lastAction = status
+                    }
                 case "done":
                     if self.statusText == "Executing..." {
                         self.statusText = "Listening..."
@@ -99,6 +109,11 @@ final class AppState: ObservableObject {
                 }
 
             case .error(let message):
+                if self.isRecording && self.isStartupConfigurationError(message) {
+                    self.micService.stopCapture()
+                    self.isRecording = false
+                    self.currentTranscript = ""
+                }
                 self.statusText = "Error: \(message)"
                 print("[RealtimeCode] Error: \(message)")
             }
@@ -115,6 +130,53 @@ final class AppState: ObservableObject {
                 self.reconnect()
             }
         }
+    }
+
+    private func codexStatusLine(from raw: String) -> String? {
+        var plainFallback: String?
+        for line in raw.split(whereSeparator: \.isNewline) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            if trimmed.contains("state db record_discrepancy") { continue }
+            if trimmed.hasPrefix("Reading prompt from stdin") { continue }
+
+            if let status = codexStatusFromJSONLine(trimmed) {
+                return status
+            }
+            if plainFallback == nil {
+                plainFallback = String(trimmed.prefix(160))
+            }
+        }
+        return plainFallback
+    }
+
+    private func codexStatusFromJSONLine(_ line: String) -> String? {
+        guard let data = line.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = json["type"] as? String else { return nil }
+
+        if type == "turn.started" {
+            return "Codex is thinking..."
+        }
+        if type == "turn.completed" {
+            return "Codex finished turn"
+        }
+        if type == "item.completed",
+           let item = json["item"] as? [String: Any],
+           let itemType = item["type"] as? String,
+           itemType == "agent_message",
+           let text = item["text"] as? String {
+            return String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(160))
+        }
+        return nil
+    }
+
+    private func isStartupConfigurationError(_ message: String) -> Bool {
+        if message == "OPENAI_API_KEY not set" { return true }
+        if message == "Missing workdir param" { return true }
+        if message == "Invalid workdir" { return true }
+        if message.hasPrefix("Workdir ") { return true }
+        return false
     }
 
     // MARK: - Actions
@@ -139,43 +201,31 @@ final class AppState: ObservableObject {
 
     private func connectAndStart() {
         statusText = "Connecting..."
-        orchestratorClient.connectWithSpawn { [weak self] in
-            // This is called if spawn+connect fails (via onEvent .error)
-        }
-
-        // Poll for connection, then start
-        var attempts = 0
-        Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] timer in
-            guard let self = self else { timer.invalidate(); return }
-            attempts += 1
-            if self.orchestratorClient.isConnected {
-                timer.invalidate()
+        orchestratorClient.connectWithSpawn(
+            onConnected: { [weak self] in
+                guard let self = self else { return }
                 self.isConnected = true
                 self.orchestratorClient.start(workdir: self.selectedWorkdir)
                 self.beginMicCapture()
-            } else if attempts >= 10 {
-                timer.invalidate()
-                self.statusText = "Connection failed"
+            },
+            onFailure: { [weak self] message in
+                self?.statusText = message
             }
-        }
+        )
     }
 
     private func reconnect() {
         statusText = "Reconnecting..."
-        orchestratorClient.connectWithSpawn()
-        var attempts = 0
-        Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] timer in
-            guard let self = self else { timer.invalidate(); return }
-            attempts += 1
-            if self.orchestratorClient.isConnected {
-                timer.invalidate()
+        orchestratorClient.connectWithSpawn(
+            onConnected: { [weak self] in
+                guard let self = self else { return }
                 self.isConnected = true
                 self.statusText = "Ready"
-            } else if attempts >= 10 {
-                timer.invalidate()
-                self.statusText = "Reconnect failed"
+            },
+            onFailure: { [weak self] _ in
+                self?.statusText = "Reconnect failed"
             }
-        }
+        )
     }
 
     private func beginMicCapture() {

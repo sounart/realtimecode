@@ -8,6 +8,7 @@
   "scripts": {
     "build": "npm run build --workspaces",
     "typecheck": "npm run typecheck --workspaces",
+    "test": "npm run test --workspaces",
     "start": "npm run start --workspace=@realtimecode/orchestrator"
   },
   "engines": {

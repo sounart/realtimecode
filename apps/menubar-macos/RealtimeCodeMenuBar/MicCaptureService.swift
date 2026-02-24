@@ -7,6 +7,7 @@ final class MicCaptureService {
     private var audioConverter: AVAudioConverter?
     private let targetSampleRate: Double = 24000
     private let targetChannels: AVAudioChannelCount = 1
+    private var tapInstalled = false
 
     private(set) var isCapturing = false
 
@@ -67,19 +68,39 @@ final class MicCaptureService {
         // Buffer size: ~100ms of audio at input sample rate
         let bufferSize: AVAudioFrameCount = AVAudioFrameCount(inputFormat.sampleRate * 0.1)
 
+        if tapInstalled {
+            inputNode.removeTap(onBus: 0)
+            tapInstalled = false
+        }
+
         inputNode.installTap(onBus: 0, bufferSize: bufferSize, format: inputFormat) {
             [weak self] buffer, _ in
             self?.processAudioBuffer(buffer)
         }
+        tapInstalled = true
 
-        try audioEngine.start()
-        isCapturing = true
+        do {
+            try audioEngine.start()
+            isCapturing = true
+        } catch {
+            if tapInstalled {
+                inputNode.removeTap(onBus: 0)
+                tapInstalled = false
+            }
+            audioConverter = nil
+            isCapturing = false
+            throw error
+        }
     }
 
     func stopCapture() {
-        guard isCapturing else { return }
-        audioEngine.inputNode.removeTap(onBus: 0)
-        audioEngine.stop()
+        if tapInstalled {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            tapInstalled = false
+        }
+        if audioEngine.isRunning {
+            audioEngine.stop()
+        }
         audioConverter = nil
         isCapturing = false
     }
