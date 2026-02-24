@@ -1,24 +1,63 @@
 import Cocoa
 import Foundation
 
-/// Recording activation mode.
-enum RecordingMode {
-    /// Press hotkey to start, press again to stop.
-    case toggle
-    /// Hold hotkey to record, release to stop and commit utterance.
-    case pushToTalk
+/// Supported global hotkey presets.
+enum HotkeyPreset: String, CaseIterable, Identifiable {
+    case commandShiftR
+    case commandOptionR
+    case controlOptionSpace
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .commandShiftR:
+            return "Cmd+Shift+R"
+        case .commandOptionR:
+            return "Cmd+Option+R"
+        case .controlOptionSpace:
+            return "Ctrl+Option+Space"
+        }
+    }
+
+    var keyCode: CGKeyCode {
+        switch self {
+        case .commandShiftR, .commandOptionR:
+            return 15 // ANSI R
+        case .controlOptionSpace:
+            return 49 // Space
+        }
+    }
+
+    var cgModifiers: CGEventFlags {
+        switch self {
+        case .commandShiftR:
+            return [.maskCommand, .maskShift]
+        case .commandOptionR:
+            return [.maskCommand, .maskAlternate]
+        case .controlOptionSpace:
+            return [.maskControl, .maskAlternate]
+        }
+    }
+
+    var nsModifiers: NSEvent.ModifierFlags {
+        switch self {
+        case .commandShiftR:
+            return [.command, .shift]
+        case .commandOptionR:
+            return [.command, .option]
+        case .controlOptionSpace:
+            return [.control, .option]
+        }
+    }
 }
 
-/// Manages a global hotkey for toggling recording.
+/// Manages a global hotkey for recording toggle.
 ///
-/// Uses CGEvent tap when Accessibility permissions are available (required for push-to-talk
-/// key-up detection), with a fallback to NSEvent global monitors for toggle mode.
+/// Uses CGEvent tap when Accessibility permissions are available,
+/// with a fallback to NSEvent global monitors.
 final class HotkeyManager {
-    /// The key code for 'R' (ANSI keyboard).
-    private static let keyCodeR: CGKeyCode = 15
-
-    /// Required modifier flags: Cmd + Shift.
-    private static let requiredModifiers: CGEventFlags = [.maskCommand, .maskShift]
+    private static let defaultsKey = "RealtimeCodeMenuBar.hotkeyPreset"
 
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
@@ -26,27 +65,37 @@ final class HotkeyManager {
     private var localMonitor: Any?
 
     private(set) var isListening = false
-    private(set) var isKeyDown = false
+    private(set) var preset: HotkeyPreset
 
-    var mode: RecordingMode = .toggle
+    /// Called when the hotkey is pressed (toggle).
+    var onToggle: (() -> Void)?
 
-    /// Called when recording should be toggled (toggle mode) or started (push-to-talk).
-    var onRecordingStart: (() -> Void)?
+    init() {
+        if let saved = UserDefaults.standard.string(forKey: Self.defaultsKey),
+           let savedPreset = HotkeyPreset(rawValue: saved) {
+            preset = savedPreset
+        } else {
+            preset = .commandShiftR
+        }
+    }
 
-    /// Called when recording should stop (push-to-talk key release).
-    /// In toggle mode, onRecordingStart handles both start and stop.
-    var onRecordingStop: (() -> Void)?
+    func setPreset(_ newPreset: HotkeyPreset) {
+        guard newPreset != preset else { return }
+        preset = newPreset
+        UserDefaults.standard.set(newPreset.rawValue, forKey: Self.defaultsKey)
+        if isListening {
+            stopListening()
+            startListening()
+        }
+    }
 
     func startListening() {
         guard !isListening else { return }
-
         if setupEventTap() {
             isListening = true
             return
         }
-
-        // Fallback: NSEvent monitors (toggle mode only — push-to-talk keyUp
-        // may not be reliably delivered globally without CGEvent tap).
+        // Fallback: NSEvent monitors
         setupNSEventMonitors()
         isListening = true
     }
@@ -73,7 +122,6 @@ final class HotkeyManager {
         }
 
         isListening = false
-        isKeyDown = false
     }
 
     // MARK: - CGEvent Tap
@@ -88,13 +136,13 @@ final class HotkeyManager {
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
-            options: .listenOnly,
+            options: .defaultTap,
             eventsOfInterest: mask,
             callback: { _, type, event, userInfo -> Unmanaged<CGEvent>? in
                 guard let userInfo = userInfo else { return Unmanaged.passUnretained(event) }
                 let manager = Unmanaged<HotkeyManager>.fromOpaque(userInfo).takeUnretainedValue()
-                manager.handleCGEvent(type: type, event: event)
-                return Unmanaged.passUnretained(event)
+                let consumed = manager.handleCGEvent(type: type, event: event)
+                return consumed ? nil : Unmanaged.passUnretained(event)
             },
             userInfo: userInfo
         ) else {
@@ -105,38 +153,29 @@ final class HotkeyManager {
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
 
-        self.eventTap = tap
-        self.runLoopSource = source
+        eventTap = tap
+        runLoopSource = source
         return true
     }
 
-    private func handleCGEvent(type: CGEventType, event: CGEvent) {
+    private func handleCGEvent(type: CGEventType, event: CGEvent) -> Bool {
         let keyCode = CGKeyCode(event.getIntegerValueField(.keyboardEventKeycode))
         let flags = event.flags
+        guard keyCode == preset.keyCode, flags.contains(preset.cgModifiers) else { return false }
 
-        guard keyCode == Self.keyCodeR,
-              flags.contains(Self.requiredModifiers) else { return }
-
-        switch type {
-        case .keyDown:
-            guard !isKeyDown else { return } // Ignore key repeat
-            isKeyDown = true
+        if type == .keyDown {
+            // Ignore key repeat
+            if event.getIntegerValueField(.keyboardEventAutorepeat) != 0 { return true }
             DispatchQueue.main.async { [weak self] in
-                self?.onRecordingStart?()
+                self?.onToggle?()
             }
-
-        case .keyUp:
-            guard isKeyDown else { return }
-            isKeyDown = false
-            if mode == .pushToTalk {
-                DispatchQueue.main.async { [weak self] in
-                    self?.onRecordingStop?()
-                }
-            }
-
-        default:
-            break
+            return true
         }
+
+        // Consume keyUp for our hotkey to prevent it reaching other apps
+        if type == .keyUp { return true }
+
+        return false
     }
 
     // MARK: - NSEvent Monitors (Fallback)
@@ -146,7 +185,6 @@ final class HotkeyManager {
             [weak self] event in
             self?.handleNSEvent(event)
         }
-
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) {
             [weak self] event in
             self?.handleNSEvent(event)
@@ -155,13 +193,11 @@ final class HotkeyManager {
     }
 
     private func handleNSEvent(_ event: NSEvent) {
-        guard event.keyCode == Self.keyCodeR,
-              event.modifierFlags.contains(.command),
-              event.modifierFlags.contains(.shift) else { return }
-
-        // NSEvent monitors only support toggle mode reliably
+        if event.isARepeat { return }
+        guard event.keyCode == preset.keyCode else { return }
+        guard event.modifierFlags.contains(preset.nsModifiers) else { return }
         DispatchQueue.main.async { [weak self] in
-            self?.onRecordingStart?()
+            self?.onToggle?()
         }
     }
 }

@@ -3,13 +3,12 @@
   "version": "0.1.0",
   "private": true,
   "workspaces": [
-    "apps/*",
-    "services/*",
-    "packages/*"
+    "services/*"
   ],
   "scripts": {
     "build": "npm run build --workspaces",
-    "typecheck": "npm run typecheck --workspaces"
+    "typecheck": "npm run typecheck --workspaces",
+    "start": "npm run start --workspace=@realtimecode/orchestrator"
   },
   "engines": {
     "node": ">=22"

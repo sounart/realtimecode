@@ -6,23 +6,22 @@ enum OrchestratorError: Error, LocalizedError {
     case connectionFailed(String)
     case notConnected
     case sendFailed(String)
-    case invalidResponse(String)
 
     var errorDescription: String? {
         switch self {
         case .connectionFailed(let msg): return "Connection failed: \(msg)"
         case .notConnected: return "Not connected to orchestrator"
         case .sendFailed(let msg): return "Send failed: \(msg)"
-        case .invalidResponse(let msg): return "Invalid response: \(msg)"
         }
     }
 }
 
-/// Events received from the orchestrator.
+/// Events received from the orchestrator backend.
 enum OrchestratorEvent {
-    case status(state: String, sessionId: String)
+    case status(state: String)
     case transcript(text: String, isFinal: Bool)
-    case error(message: String, recoverable: Bool)
+    case codex(type: String, data: [String: Any])
+    case error(message: String)
 }
 
 /// IPC client for the orchestrator daemon via Unix domain socket.
@@ -34,10 +33,12 @@ final class OrchestratorClient {
     private var readBuffer = Data()
     private var nextRequestId: Int = 1
     private let queue = DispatchQueue(label: "com.realtimecode.orchestrator-client")
+    private var backendProcess: Process?
+    private var reconnectTimer: DispatchSourceTimer?
 
     private(set) var isConnected = false
 
-    /// Called on the main queue when an event is received from the orchestrator.
+    /// Called on the main queue when an event is received.
     var onEvent: ((OrchestratorEvent) -> Void)?
 
     /// Called on the main queue when the connection is lost.
@@ -48,6 +49,57 @@ final class OrchestratorClient {
         self.socketPath = socketPath
             ?? ProcessInfo.processInfo.environment["RTC_SOCKET_PATH"]
             ?? "\(home)/.runtime/realtimecode/orchestrator.sock"
+    }
+
+    // MARK: - Backend Spawning
+
+    /// Ensures the Node.js backend is running. Spawns it if the socket doesn't exist.
+    func ensureBackend() {
+        if FileManager.default.fileExists(atPath: socketPath) { return }
+        spawnBackend()
+    }
+
+    private func spawnBackend() {
+        let proc = Process()
+        // Look for npx in common locations
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        proc.arguments = ["npx", "tsx", "src/server.ts"]
+
+        // Resolve orchestrator directory relative to the app bundle or a known location
+        let orchestratorDir = ProcessInfo.processInfo.environment["RTC_ORCHESTRATOR_DIR"]
+            ?? findOrchestratorDir()
+        proc.currentDirectoryURL = URL(fileURLWithPath: orchestratorDir)
+
+        // Pass through environment (especially OPENAI_API_KEY, PATH)
+        var env = ProcessInfo.processInfo.environment
+        env["NODE_NO_WARNINGS"] = "1"
+        proc.environment = env
+
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+
+        do {
+            try proc.run()
+            backendProcess = proc
+        } catch {
+            print("[OrchestratorClient] Failed to spawn backend: \(error)")
+        }
+    }
+
+    private func findOrchestratorDir() -> String {
+        // Try common locations relative to the user's home
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let candidates = [
+            "\(home)/Code/realtimecode/services/orchestrator",
+            "\(home)/code/realtimecode/services/orchestrator",
+            "\(home)/Developer/realtimecode/services/orchestrator",
+        ]
+        for candidate in candidates {
+            if FileManager.default.fileExists(atPath: "\(candidate)/src/server.ts") {
+                return candidate
+            }
+        }
+        return candidates[0]
     }
 
     // MARK: - Connection
@@ -97,8 +149,37 @@ final class OrchestratorClient {
         startReading()
     }
 
+    /// Spawn backend if needed, then connect with retries.
+    func connectWithSpawn(retries: Int = 10, delay: TimeInterval = 0.5) {
+        ensureBackend()
+
+        var attempts = 0
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now(), repeating: delay)
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { timer.cancel(); return }
+            attempts += 1
+
+            do {
+                try self.connect()
+                timer.cancel()
+                self.reconnectTimer = nil
+            } catch {
+                if attempts >= retries {
+                    timer.cancel()
+                    self.reconnectTimer = nil
+                    self.onEvent?(.error(message: "Failed to connect to backend after \(retries) attempts"))
+                }
+            }
+        }
+        timer.resume()
+        reconnectTimer = timer
+    }
+
     func disconnect() {
         guard isConnected else { return }
+        reconnectTimer?.cancel()
+        reconnectTimer = nil
         readSource?.cancel()
         readSource = nil
         close(socketFd)
@@ -109,37 +190,24 @@ final class OrchestratorClient {
 
     // MARK: - JSON-RPC Methods
 
-    /// Start an orchestrator session for the given working directory.
-    func sessionStart(workdir: String, profile: String = "default") {
+    /// Start listening in the given working directory.
+    func start(workdir: String) {
         let id = nextId()
-        let params: [String: Any] = ["workdir": workdir, "profile": profile]
-        sendRequest(id: id, method: "session.start", params: params)
+        sendRequest(id: id, method: "start", params: ["workdir": workdir])
     }
 
-    /// Stop the current orchestrator session.
-    func sessionStop(sessionId: String) {
+    /// Stop everything.
+    func stop() {
         let id = nextId()
-        let params: [String: Any] = ["sessionId": sessionId]
-        sendRequest(id: id, method: "session.stop", params: params)
+        sendRequest(id: id, method: "stop", params: [:])
     }
 
     /// Stream an audio chunk (base64-encoded PCM16 24kHz mono).
-    /// Sent as a JSON-RPC notification (no response expected).
     func streamAudio(base64Chunk: String) {
         let notification: [String: Any] = [
             "jsonrpc": "2.0",
-            "method": "audio.stream",
-            "params": ["audio": base64Chunk]
-        ]
-        sendJSON(notification)
-    }
-
-    /// Commit the current audio buffer (for push-to-talk release).
-    func commitAudioBuffer() {
-        let notification: [String: Any] = [
-            "jsonrpc": "2.0",
-            "method": "audio.commit",
-            "params": [String: Any]()
+            "method": "audio",
+            "params": ["chunk": base64Chunk]
         ]
         sendJSON(notification)
     }
@@ -179,13 +247,20 @@ final class OrchestratorClient {
                 var sent = 0
                 while sent < lineData.count {
                     let result = write(self.socketFd, baseAddress + sent, lineData.count - sent)
+                    if result > 0 {
+                        sent += result
+                        continue
+                    }
+                    let err = errno
+                    if err == EINTR { continue }
+                    if err == EAGAIN || err == EWOULDBLOCK {
+                        usleep(1_000)
+                        continue
+                    }
                     if result <= 0 {
-                        DispatchQueue.main.async {
-                            self.handleDisconnect()
-                        }
+                        DispatchQueue.main.async { self.handleDisconnect() }
                         return
                     }
-                    sent += result
                 }
             }
         }
@@ -200,7 +275,13 @@ final class OrchestratorClient {
             var buf = [UInt8](repeating: 0, count: 8192)
             let bytesRead = read(self.socketFd, &buf, buf.count)
 
-            if bytesRead <= 0 {
+            if bytesRead == 0 {
+                DispatchQueue.main.async { self.handleDisconnect() }
+                return
+            }
+            if bytesRead < 0 {
+                let err = errno
+                if err == EINTR || err == EAGAIN || err == EWOULDBLOCK { return }
                 DispatchQueue.main.async { self.handleDisconnect() }
                 return
             }
@@ -238,35 +319,37 @@ final class OrchestratorClient {
     }
 
     private func handleMessage(_ json: [String: Any]) {
-        // JSON-RPC response (has id)
+        // JSON-RPC response (has id) — check for errors
         if json["id"] != nil {
             if let error = json["error"] as? [String: Any],
                let message = error["message"] as? String {
-                onEvent?(.error(message: message, recoverable: true))
+                onEvent?(.error(message: message))
             }
-            // Responses to session.start/stop are acknowledged silently
             return
         }
 
-        // JSON-RPC notification (event from orchestrator)
+        // JSON-RPC notification
         guard let method = json["method"] as? String,
               let params = json["params"] as? [String: Any] else { return }
 
         switch method {
-        case "event.status":
+        case "status":
             let state = params["state"] as? String ?? "unknown"
-            let sessionId = params["sessionId"] as? String ?? ""
-            onEvent?(.status(state: state, sessionId: sessionId))
+            onEvent?(.status(state: state))
 
-        case "event.transcript":
+        case "transcript":
             let text = params["text"] as? String ?? ""
             let isFinal = params["final"] as? Bool ?? false
             onEvent?(.transcript(text: text, isFinal: isFinal))
 
-        case "event.error":
+        case "codex":
+            let type = params["type"] as? String ?? ""
+            let data = params["data"] as? [String: Any] ?? [:]
+            onEvent?(.codex(type: type, data: data))
+
+        case "error":
             let message = params["message"] as? String ?? "Unknown error"
-            let recoverable = params["recoverable"] as? Bool ?? true
-            onEvent?(.error(message: message, recoverable: recoverable))
+            onEvent?(.error(message: message))
 
         default:
             break

@@ -5,19 +5,15 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "start": "tsx src/server.ts",
-    "test": "vitest run"
+    "start": "tsx src/server.ts"
   },
   "dependencies": {
-    "@realtimecode/protocol": "0.1.0",
-    "@realtimecode/shared": "0.1.0",
     "ws": "^8.19.0"
   },
   "devDependencies": {
     "@types/node": "^22.13.10",
     "@types/ws": "^8.18.1",
     "tsx": "^4.19.3",
-    "typescript": "^5.8.2",
-    "vitest": "^4.0.18"
+    "typescript": "^5.8.2"
   }
 }
