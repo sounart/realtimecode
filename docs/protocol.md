@@ -3,14 +3,13 @@
 Current transport is newline-delimited JSON-RPC 2.0 over a Unix domain socket.
 
 ## Methods
-- `session.start(workdir, profile)`
-- `instruction.submit(text, metadata)`
-- `instruction.cancel(instructionId)`
-- `session.stop(sessionId)`
+- `auth` with `{ token }`
+- `start` with `{ workdir }`
+- `audio` with `{ chunk }`
+- `stop` with `{}`
 
 ## Event Types
-- `stdout`
-- `tool_call`
-- `file_change`
+- `transcript`
+- `codex` (`tool_call`, `file_change`, `output`, `done`)
 - `status`
 - `error`

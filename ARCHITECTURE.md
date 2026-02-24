@@ -33,10 +33,11 @@ Three source files under `services/orchestrator/src/`:
 - **codex.ts** — Spawns `codex exec` processes, parses JSONL output
 - **server.ts** — Unix socket server, owns session state, wires transcriber → codex
 
-### RPC Surface (3 methods)
+### RPC Surface (4 methods)
 
 | Method | Params | Description |
 |--------|--------|-------------|
+| `auth` | `{ token }` | Authenticate socket before other RPC calls |
 | `start` | `{ workdir }` | Connect transcriber, state → listening |
 | `stop` | — | Kill codex, disconnect transcriber, state → idle |
 | `audio` | `{ chunk }` | Notification, forward base64 audio to transcriber |

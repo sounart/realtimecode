@@ -175,6 +175,7 @@ final class AppState: ObservableObject {
         if message == "OPENAI_API_KEY not set" { return true }
         if message == "Missing workdir param" { return true }
         if message == "Invalid workdir" { return true }
+        if message.hasPrefix("Unauthorized:") { return true }
         if message.hasPrefix("Workdir ") { return true }
         return false
     }
@@ -325,61 +326,277 @@ struct MenuContent: View {
     @ObservedObject var appState: AppState
 
     var body: some View {
-        Text(appState.statusText)
-            .font(.headline)
+        HStack(spacing: 8) {
+            statusIndicator
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(statusTitle)
+                    .font(.headline)
+
+                if let subtitle = statusSubtitle {
+                    Text(subtitle)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+
+            Spacer(minLength: 8)
+
+            Text(connectionStatusTitle)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
 
         if !appState.currentTranscript.isEmpty {
-            Text(appState.currentTranscript)
-                .font(.caption)
-                .lineLimit(3)
+            infoRow(
+                title: "Transcript",
+                systemImage: "waveform",
+                text: appState.currentTranscript,
+                lineLimit: 3
+            )
         }
 
         if !appState.lastAction.isEmpty {
-            Text(appState.lastAction)
-                .font(.caption2)
-                .lineLimit(2)
+            infoRow(
+                title: "Last Action",
+                systemImage: "sparkles",
+                text: appState.lastAction,
+                lineLimit: 2
+            )
         }
 
         Divider()
 
-        Button(appState.isRecording ? "Stop Recording" : "Start Recording") {
+        Button {
             if appState.isRecording {
                 appState.stopRecording()
             } else {
                 appState.startRecording()
             }
+        } label: {
+            Label(
+                appState.isRecording ? "Stop Recording" : "Start Recording",
+                systemImage: appState.isRecording ? "stop.circle.fill" : "mic.circle.fill"
+            )
         }
+        .keyboardShortcut("r")
+        .disabled(isConnecting)
 
         Divider()
 
-        Text(appState.selectedWorkdir)
-            .font(.caption2)
-            .lineLimit(1)
-            .truncationMode(.middle)
+        Label {
+            Text(displayWorkdir)
+                .font(.caption2)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        } icon: {
+            Image(systemName: "folder")
+                .foregroundStyle(.secondary)
+        }
+        .help(appState.selectedWorkdir)
 
-        Button("Choose Directory...") {
+        Button {
             appState.chooseWorkdir()
+        } label: {
+            Label("Choose Directory...", systemImage: "folder.badge.gearshape")
         }
+
+        Button {
+            revealWorkdirInFinder()
+        } label: {
+            Label("Reveal in Finder", systemImage: "arrow.up.forward.app")
+        }
+        .disabled(!canRevealWorkdir)
 
         Divider()
 
-        Menu("Hotkey: \(appState.hotkeyPreset.displayName)") {
+        Menu {
             ForEach(HotkeyPreset.allCases) { preset in
-                Button(preset.displayName) {
+                Button {
                     appState.setHotkeyPreset(preset)
+                } label: {
+                    if preset == appState.hotkeyPreset {
+                        Label(preset.displayName, systemImage: "checkmark")
+                    } else {
+                        Text(preset.displayName)
+                    }
                 }
             }
+        } label: {
+            Label("Hotkey: \(appState.hotkeyPreset.displayName)", systemImage: "keyboard")
         }
 
-        Button(appState.hotkeyEnabled ? "Disable Hotkey" : "Enable Hotkey") {
+        Button {
             appState.toggleHotkeyListening()
+        } label: {
+            Label(
+                appState.hotkeyEnabled ? "Disable Hotkey" : "Enable Hotkey",
+                systemImage: appState.hotkeyEnabled ? "bolt.slash.fill" : "bolt.fill"
+            )
         }
 
         Divider()
 
-        Button("Quit") {
+        Button(role: .destructive) {
             appState.quit()
+        } label: {
+            Label("Quit RealtimeCode", systemImage: "power")
         }
         .keyboardShortcut("q")
+    }
+
+    private enum StatusSummary {
+        case ready
+        case connected
+        case connecting
+        case listening
+        case executing
+        case disconnected
+        case error(String)
+    }
+
+    private var summary: StatusSummary {
+        if appState.statusText.hasPrefix("Error:") {
+            let message = appState.statusText
+                .replacingOccurrences(of: "Error:", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return .error(message)
+        }
+
+        if appState.statusText == "Connecting..." || appState.statusText == "Reconnecting..." {
+            return .connecting
+        }
+
+        if appState.statusText == "Disconnected" {
+            return .disconnected
+        }
+
+        if appState.statusText == "Executing..." {
+            return .executing
+        }
+
+        if appState.isRecording || appState.statusText == "Listening..." {
+            return .listening
+        }
+
+        if appState.isConnected {
+            return .connected
+        }
+
+        return .ready
+    }
+
+    private var isConnecting: Bool {
+        if case .connecting = summary { return true }
+        return false
+    }
+
+    private var statusTitle: String {
+        switch summary {
+        case .ready:
+            return "Ready"
+        case .connected:
+            return "Connected"
+        case .connecting:
+            return "Connecting"
+        case .listening:
+            return "Listening"
+        case .executing:
+            return "Executing"
+        case .disconnected:
+            return "Disconnected"
+        case .error:
+            return "Error"
+        }
+    }
+
+    private var statusSubtitle: String? {
+        switch summary {
+        case .error(let message):
+            return message.isEmpty ? nil : message
+        case .connecting:
+            return "Starting services"
+        case .executing:
+            return "Running your request"
+        case .disconnected:
+            return "Reconnects on next start"
+        default:
+            return nil
+        }
+    }
+
+    private var connectionStatusTitle: String {
+        if case .connecting = summary {
+            return "Starting"
+        }
+        return appState.isConnected ? "Online" : "Offline"
+    }
+
+    private var statusColor: Color {
+        switch summary {
+        case .error:
+            return .red
+        case .connecting:
+            return .blue
+        case .listening:
+            return .red
+        case .executing:
+            return .orange
+        case .connected:
+            return .green
+        case .disconnected:
+            return .orange
+        case .ready:
+            return .secondary
+        }
+    }
+
+    @ViewBuilder
+    private var statusIndicator: some View {
+        switch summary {
+        case .connecting, .executing:
+            ProgressView()
+                .controlSize(.small)
+                .frame(width: 10, height: 10)
+        default:
+            Circle()
+                .fill(statusColor)
+                .frame(width: 8, height: 8)
+        }
+    }
+
+    private var canRevealWorkdir: Bool {
+        FileManager.default.fileExists(atPath: appState.selectedWorkdir)
+    }
+
+    private var displayWorkdir: String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if appState.selectedWorkdir == home {
+            return "~"
+        }
+        if appState.selectedWorkdir.hasPrefix(home + "/") {
+            let suffix = appState.selectedWorkdir.dropFirst(home.count + 1)
+            return "~/" + suffix
+        }
+        return appState.selectedWorkdir
+    }
+
+    private func revealWorkdirInFinder() {
+        let url = URL(fileURLWithPath: appState.selectedWorkdir)
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    @ViewBuilder
+    private func infoRow(title: String, systemImage: String, text: String, lineLimit: Int) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Label(title, systemImage: systemImage)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(text)
+                .font(.caption)
+                .lineLimit(lineLimit)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 }
