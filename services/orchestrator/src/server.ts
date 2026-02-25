@@ -28,6 +28,66 @@ const MAX_AUDIO_CHUNK_BASE64_CHARS = parseBoundedInt(
   2_000_000,
 );
 const LOG_INSTRUCTION_PREVIEW = process.env['RTC_LOG_INSTRUCTION_PREVIEW'] === '1';
+const TRANSCRIPT_COMMIT_DELAY_MS = parseBoundedInt(
+  process.env['RTC_TRANSCRIPT_COMMIT_DELAY_MS'],
+  750,
+  100,
+  5_000,
+);
+const MIN_EXECUTABLE_TRANSCRIPT_CHARS = parseBoundedInt(
+  process.env['RTC_MIN_EXECUTABLE_TRANSCRIPT_CHARS'],
+  8,
+  1,
+  200,
+);
+const MIN_EXECUTABLE_TRANSCRIPT_WORDS = parseBoundedInt(
+  process.env['RTC_MIN_EXECUTABLE_TRANSCRIPT_WORDS'],
+  2,
+  1,
+  20,
+);
+const MAX_PENDING_INSTRUCTIONS = parseBoundedInt(
+  process.env['RTC_MAX_PENDING_INSTRUCTIONS'],
+  8,
+  1,
+  128,
+);
+const TRANSCRIPT_DEDUPE_WINDOW_MS = parseBoundedInt(
+  process.env['RTC_TRANSCRIPT_DEDUPE_WINDOW_MS'],
+  4_000,
+  500,
+  30_000,
+);
+const FILLER_WORDS = new Set([
+  'ah',
+  'eh',
+  'er',
+  'hmm',
+  'huh',
+  'mm',
+  'mmm',
+  'uh',
+  'uhh',
+  'um',
+]);
+const SHORT_COMMAND_WORDS = new Set([
+  'add',
+  'build',
+  'cancel',
+  'commit',
+  'continue',
+  'deploy',
+  'fix',
+  'lint',
+  'pull',
+  'push',
+  'quit',
+  'run',
+  'start',
+  'status',
+  'stop',
+  'test',
+]);
 
 let state: SessionState = 'idle';
 let workdir: string | null = null;
@@ -38,6 +98,11 @@ const authenticatedSockets = new Set<net.Socket>();
 let activeServer: net.Server | null = null;
 let shuttingDown = false;
 let authToken: string | null = null;
+const pendingInstructions: string[] = [];
+let transcriptParts: string[] = [];
+let transcriptCommitTimer: NodeJS.Timeout | null = null;
+let lastQueuedInstruction = '';
+let lastQueuedAtMs = 0;
 
 function parseBoundedInt(
   raw: string | undefined,
@@ -98,6 +163,123 @@ function setState(next: SessionState): void {
   broadcastStatus();
 }
 
+function normalizeText(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+function tokenizeWords(text: string): string[] {
+  return (text.toLowerCase().match(/[a-z0-9']+/g) ?? [])
+    .map((w) => w.replace(/^'+|'+$/g, ''))
+    .filter((w) => w.length > 0);
+}
+
+function clearTranscriptParts(): void {
+  transcriptParts = [];
+  if (transcriptCommitTimer) {
+    clearTimeout(transcriptCommitTimer);
+    transcriptCommitTimer = null;
+  }
+}
+
+function clearInstructionQueue(): void {
+  pendingInstructions.length = 0;
+  clearTranscriptParts();
+}
+
+function shouldIgnoreInstructionText(normalized: string): { ignore: boolean; reason?: string; words: number; alnumChars: number } {
+  const words = tokenizeWords(normalized);
+  const alnumChars = normalized.replace(/[^a-z0-9]/gi, '').length;
+
+  if (!normalized) return { ignore: true, reason: 'empty', words: 0, alnumChars: 0 };
+  if (words.length === 0) return { ignore: true, reason: 'no_words', words: 0, alnumChars };
+  if (words.length === 1 && FILLER_WORDS.has(words[0] ?? '')) {
+    return { ignore: true, reason: 'single_filler_word', words: 1, alnumChars };
+  }
+  if (words.length <= 3 && words.every((w) => FILLER_WORDS.has(w))) {
+    return { ignore: true, reason: 'filler_words_only', words: words.length, alnumChars };
+  }
+  if (words.length === 1 && SHORT_COMMAND_WORDS.has(words[0] ?? '')) {
+    return { ignore: false, words: 1, alnumChars };
+  }
+  if (alnumChars < MIN_EXECUTABLE_TRANSCRIPT_CHARS && words.length < MIN_EXECUTABLE_TRANSCRIPT_WORDS) {
+    return { ignore: true, reason: 'too_short', words: words.length, alnumChars };
+  }
+  return { ignore: false, words: words.length, alnumChars };
+}
+
+function processInstructionQueue(options?: { allowWhileExecuting?: boolean }): boolean {
+  if (!workdir) return false;
+  if (codex.isRunning) return false;
+  if (state === 'idle') return false;
+  if (state === 'executing' && options?.allowWhileExecuting !== true) return false;
+
+  const nextInstruction = pendingInstructions.shift();
+  if (!nextInstruction) return false;
+
+  executeInstruction(nextInstruction);
+  return true;
+}
+
+function enqueueInstruction(text: string): void {
+  const normalized = normalizeText(text);
+  const decision = shouldIgnoreInstructionText(normalized);
+  if (decision.ignore) {
+    logger.info('ignoring final transcript', {
+      reason: decision.reason ?? 'unknown',
+      words: decision.words,
+      alnumChars: decision.alnumChars,
+      rawChars: text.length,
+    });
+    return;
+  }
+
+  const now = Date.now();
+  if (normalized === lastQueuedInstruction && now - lastQueuedAtMs <= TRANSCRIPT_DEDUPE_WINDOW_MS) {
+    logger.info('ignoring duplicate final transcript', {
+      words: decision.words,
+      alnumChars: decision.alnumChars,
+      dedupeWindowMs: TRANSCRIPT_DEDUPE_WINDOW_MS,
+    });
+    return;
+  }
+
+  if (pendingInstructions.length >= MAX_PENDING_INSTRUCTIONS) {
+    pendingInstructions.shift();
+    logger.warn('instruction queue full; dropped oldest queued instruction', {
+      maxPendingInstructions: MAX_PENDING_INSTRUCTIONS,
+    });
+  }
+
+  pendingInstructions.push(normalized);
+  lastQueuedInstruction = normalized;
+  lastQueuedAtMs = now;
+  logger.info('instruction queued', {
+    chars: normalized.length,
+    queueDepth: pendingInstructions.length,
+  });
+  notify('codex', { type: 'queued', data: { queueDepth: pendingInstructions.length } });
+  processInstructionQueue();
+}
+
+function flushQueuedTranscriptParts(): void {
+  if (transcriptParts.length === 0) return;
+  const merged = normalizeText(transcriptParts.join(' '));
+  transcriptParts = [];
+  enqueueInstruction(merged);
+}
+
+function bufferFinalTranscript(text: string): void {
+  const normalized = normalizeText(text);
+  if (!normalized) return;
+
+  transcriptParts.push(normalized);
+  if (transcriptCommitTimer) clearTimeout(transcriptCommitTimer);
+  transcriptCommitTimer = setTimeout(() => {
+    transcriptCommitTimer = null;
+    flushQueuedTranscriptParts();
+  }, TRANSCRIPT_COMMIT_DELAY_MS);
+}
+
 function startListening(dir: string): string | null {
   const apiKey = process.env['OPENAI_API_KEY'];
   if (!apiKey) {
@@ -106,6 +288,9 @@ function startListening(dir: string): string | null {
   }
 
   workdir = dir;
+  clearInstructionQueue();
+  lastQueuedInstruction = '';
+  lastQueuedAtMs = 0;
 
   if (transcriber) {
     transcriber.disconnect();
@@ -118,7 +303,7 @@ function startListening(dir: string): string | null {
     },
     onFinalTranscript(text) {
       notify('transcript', { text, final: true });
-      executeInstruction(text);
+      bufferFinalTranscript(text);
     },
     onError(err) {
       logger.error('transcriber error', { message: err.message });
@@ -146,9 +331,10 @@ function startListening(dir: string): string | null {
 function executeInstruction(text: string): void {
   if (!workdir) return;
 
-  const normalized = text.replace(/\s+/g, ' ').trim();
+  const normalized = normalizeText(text);
   const meta: Record<string, unknown> = {
-    chars: text.length,
+    chars: normalized.length,
+    queueDepth: pendingInstructions.length,
   };
   if (LOG_INSTRUCTION_PREVIEW) {
     meta['preview'] = normalized.slice(0, 200);
@@ -157,7 +343,7 @@ function executeInstruction(text: string): void {
 
   setState('executing');
 
-  codex.run(text, workdir, {
+  codex.run(normalized, workdir, {
     onToolCall(tool, args) {
       notify('codex', { type: 'tool_call', data: { tool, args } });
     },
@@ -170,16 +356,14 @@ function executeInstruction(text: string): void {
     onDone() {
       notify('codex', { type: 'done', data: {} });
       logger.info('codex run completed');
-      if (state === 'executing') {
-        setState('listening');
-      }
+      if (processInstructionQueue({ allowWhileExecuting: true })) return;
+      if (state === 'executing') setState('listening');
     },
     onError(err) {
       logger.error('codex run failed', { message: err.message });
       broadcastError(err.message);
-      if (state === 'executing') {
-        setState('listening');
-      }
+      if (processInstructionQueue({ allowWhileExecuting: true })) return;
+      if (state === 'executing') setState('listening');
     },
   });
 }
@@ -187,6 +371,7 @@ function executeInstruction(text: string): void {
 function stopAll(): void {
   logger.info('stop requested');
   codex.cancel();
+  clearInstructionQueue();
   if (transcriber) {
     transcriber.disconnect();
     transcriber = null;

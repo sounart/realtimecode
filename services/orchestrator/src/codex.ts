@@ -68,11 +68,13 @@ export class CodexRunner {
   }
 
   run(instruction: string, workdir: string, cb: CodexCallbacks): void {
-    this.cancel();
-
     const trimmedInstruction = instruction.trim();
     if (!trimmedInstruction) {
       cb.onError(new Error('Empty instruction ignored'));
+      return;
+    }
+    if (this.active) {
+      cb.onError(new Error('Codex execution already in progress'));
       return;
     }
 

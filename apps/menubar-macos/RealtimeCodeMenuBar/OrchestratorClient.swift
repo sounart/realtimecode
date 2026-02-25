@@ -233,6 +233,11 @@ final class OrchestratorClient {
             "RTC_MAX_RPC_LINE_BYTES",
             "RTC_MAX_AUDIO_CHUNK_BASE64_CHARS",
             "RTC_LOG_INSTRUCTION_PREVIEW",
+            "RTC_TRANSCRIPT_COMMIT_DELAY_MS",
+            "RTC_MIN_EXECUTABLE_TRANSCRIPT_CHARS",
+            "RTC_MIN_EXECUTABLE_TRANSCRIPT_WORDS",
+            "RTC_MAX_PENDING_INSTRUCTIONS",
+            "RTC_TRANSCRIPT_DEDUPE_WINDOW_MS",
         ]
         for key in allowlist {
             if let value = inherited[key], !value.isEmpty {

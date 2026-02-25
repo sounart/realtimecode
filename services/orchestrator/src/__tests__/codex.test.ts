@@ -136,9 +136,8 @@ describe('CodexRunner', () => {
     expect(cb.onDone).not.toHaveBeenCalled();
   });
 
-  it('ignores stale close events from a replaced run', () => {
+  it('rejects overlapping runs instead of cancelling the active one', () => {
     const first = queueProcess();
-    const second = queueProcess();
 
     const runner = new CodexRunner();
     const firstCb = callbacks();
@@ -147,13 +146,12 @@ describe('CodexRunner', () => {
     runner.run('first', '/tmp', firstCb);
     runner.run('second', '/tmp', secondCb);
 
-    // first run was cancelled by the second run; this close must not affect active state.
-    first.emit('close', 0, null);
-    expect(firstCb.onDone).not.toHaveBeenCalled();
-    expect(firstCb.onError).not.toHaveBeenCalled();
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(secondCb.onError).toHaveBeenCalledTimes(1);
+    expect(secondCb.onDone).not.toHaveBeenCalled();
 
-    second.emit('close', 0, null);
-    expect(secondCb.onDone).toHaveBeenCalledTimes(1);
-    expect(secondCb.onError).not.toHaveBeenCalled();
+    first.emit('close', 0, null);
+    expect(firstCb.onDone).toHaveBeenCalledTimes(1);
+    expect(firstCb.onError).not.toHaveBeenCalled();
   });
 });
