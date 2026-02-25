@@ -195,6 +195,66 @@ describe('Transcriber', () => {
     expect(capturedUrl).toBe('wss://api.openai.com/v1/realtime?model=gpt-realtime-mini');
   });
 
+  it('falls back to default realtime session model when a transcription-only model is configured', () => {
+    vi.stubEnv('RTC_REALTIME_SESSION_MODEL', 'gpt-4o-transcribe');
+
+    let capturedUrl = '';
+    const socketFactory = (url: string) => {
+      capturedUrl = url;
+      return new FakeSocket() as unknown as WebSocket;
+    };
+
+    const transcriber = new Transcriber(
+      { apiKey: 'test', socketFactory },
+      {
+        onPartialTranscript: vi.fn(),
+        onFinalTranscript: vi.fn(),
+        onError: vi.fn(),
+        onReady: vi.fn(),
+      },
+    );
+
+    transcriber.connect();
+    expect(capturedUrl).toBe('wss://api.openai.com/v1/realtime?model=gpt-realtime');
+  });
+
+  it('falls back to default transcription model when env value is invalid', () => {
+    vi.stubEnv('RTC_TRANSCRIBE_MODEL', 'gpt-4o-transcribe-latest');
+
+    const sockets: FakeSocket[] = [];
+    const socketFactory = () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket as unknown as WebSocket;
+    };
+
+    const transcriber = new Transcriber(
+      { apiKey: 'test', socketFactory },
+      {
+        onPartialTranscript: vi.fn(),
+        onFinalTranscript: vi.fn(),
+        onError: vi.fn(),
+        onReady: vi.fn(),
+      },
+    );
+
+    transcriber.connect();
+    const socket = sockets[0];
+    socket.readyState = FakeSocket.OPEN;
+    socket.emit('open');
+
+    const update = parsePayload(socket.sent[0]);
+    expect(update.session).toMatchObject({
+      audio: {
+        input: {
+          transcription: {
+            model: 'gpt-4o-transcribe',
+          },
+        },
+      },
+    });
+  });
+
   it('allows custom realtime URLs when RTC_ALLOW_CUSTOM_REALTIME_URL=1', () => {
     vi.stubEnv('RTC_REALTIME_URL', 'wss://example.com/v1/realtime');
     vi.stubEnv('RTC_ALLOW_CUSTOM_REALTIME_URL', '1');

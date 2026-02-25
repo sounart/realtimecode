@@ -39,6 +39,7 @@ type ServerEvent =
 const DEFAULT_REALTIME_URL_BASE = 'wss://api.openai.com/v1/realtime';
 const DEFAULT_REALTIME_SESSION_MODEL = 'gpt-realtime';
 const DEFAULT_TRANSCRIPTION_MODEL = 'gpt-4o-transcribe';
+const TRANSCRIPTION_MODEL_PATTERN = /^(whisper-1|gpt-4o(?:-mini)?-transcribe(?:-\d{4}-\d{2}-\d{2})?)$/;
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null;
@@ -90,6 +91,33 @@ function resolveRealtimeUrl(rawUrl: string | undefined, sessionModel: string): s
   return parsed.toString();
 }
 
+function normalizeRealtimeSessionModel(rawModel: string | undefined): string {
+  const trimmed = rawModel?.trim();
+  if (!trimmed) return DEFAULT_REALTIME_SESSION_MODEL;
+
+  if (trimmed === 'whisper-1' || trimmed.includes('transcribe')) {
+    logger.warn('invalid realtime session model; using default', {
+      requestedModel: trimmed,
+      fallbackModel: DEFAULT_REALTIME_SESSION_MODEL,
+    });
+    return DEFAULT_REALTIME_SESSION_MODEL;
+  }
+
+  return trimmed;
+}
+
+function normalizeTranscriptionModel(rawModel: string | undefined): string {
+  const trimmed = rawModel?.trim();
+  if (!trimmed) return DEFAULT_TRANSCRIPTION_MODEL;
+  if (TRANSCRIPTION_MODEL_PATTERN.test(trimmed)) return trimmed;
+
+  logger.warn('invalid transcription model; using default', {
+    requestedModel: trimmed,
+    fallbackModel: DEFAULT_TRANSCRIPTION_MODEL,
+  });
+  return DEFAULT_TRANSCRIPTION_MODEL;
+}
+
 export class Transcriber {
   private static readonly MAX_PENDING_AUDIO_CHUNKS = 64;
   private static readonly MAX_TRACKED_EMITTED_ITEMS = 2_048;
@@ -126,12 +154,13 @@ export class Transcriber {
 
   constructor(options: TranscriberOptions, callbacks: TranscriberCallbacks) {
     this.apiKey = options.apiKey;
-    this.transcriptionModel = options.model
-      ?? process.env['RTC_TRANSCRIBE_MODEL']
-      ?? DEFAULT_TRANSCRIPTION_MODEL;
-    this.realtimeSessionModel = process.env['RTC_REALTIME_SESSION_MODEL']
-      ?? process.env['RTC_REALTIME_MODEL']
-      ?? DEFAULT_REALTIME_SESSION_MODEL;
+    this.transcriptionModel = normalizeTranscriptionModel(
+      options.model ?? process.env['RTC_TRANSCRIBE_MODEL'],
+    );
+    this.realtimeSessionModel = normalizeRealtimeSessionModel(
+      process.env['RTC_REALTIME_SESSION_MODEL']
+      ?? process.env['RTC_REALTIME_MODEL'],
+    );
     this.language = options.language ?? process.env['RTC_TRANSCRIBE_LANGUAGE'] ?? null;
     this.vadThreshold = options.vadThreshold ?? 0.5;
     this.silenceDurationMs = options.silenceDurationMs ?? 800;
