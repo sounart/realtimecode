@@ -34,7 +34,7 @@ final class OrchestratorClient {
 
     private let socketPath: String
     private let authTokenPath: String
-    private let authToken: String
+    private var authToken: String
     private var socketFd: Int32 = -1
     private var readSource: DispatchSourceRead?
     private var readBuffer = Data()
@@ -45,6 +45,10 @@ final class OrchestratorClient {
     private var reconnectTimer: DispatchSourceTimer?
 
     private(set) var isConnected = false
+    private var isAuthenticated = false
+    private var authRequestId: Int?
+    private var authRetryAttempted = false
+    private var pendingOutboundMessages: [[String: Any]] = []
 
     /// Called on the main queue when an event is received.
     var onEvent: ((OrchestratorEvent) -> Void)?
@@ -58,8 +62,11 @@ final class OrchestratorClient {
         self.socketPath = socketPath
             ?? ProcessInfo.processInfo.environment["RTC_SOCKET_PATH"]
             ?? "\(runtimeDir)/orchestrator.sock"
+        let socketDir = URL(fileURLWithPath: self.socketPath)
+            .deletingLastPathComponent()
+            .path
         self.authTokenPath = ProcessInfo.processInfo.environment["RTC_AUTH_TOKEN_PATH"]
-            ?? "\(runtimeDir)/orchestrator.token"
+            ?? "\(socketDir)/orchestrator.token"
         self.authToken = Self.resolveAuthToken(
             explicitToken: ProcessInfo.processInfo.environment["RTC_AUTH_TOKEN"],
             tokenPath: self.authTokenPath
@@ -91,9 +98,10 @@ final class OrchestratorClient {
         proc.arguments = [tsxCliPath, "src/server.ts"]
         proc.currentDirectoryURL = URL(fileURLWithPath: orchestratorDir)
         proc.environment = buildBackendEnvironment()
-
-        proc.standardOutput = FileHandle.nullDevice
-        proc.standardError = FileHandle.nullDevice
+        if ProcessInfo.processInfo.environment["RTC_BACKEND_STDIO"]?.lowercased() == "null" {
+            proc.standardOutput = FileHandle.nullDevice
+            proc.standardError = FileHandle.nullDevice
+        }
 
         do {
             try proc.run()
@@ -213,8 +221,13 @@ final class OrchestratorClient {
             "RTC_CODEX_KILL_GRACE_MS",
             "RTC_CODEX_EPHEMERAL",
             "RTC_CODEX_SKIP_GIT_REPO_CHECK",
+            "RTC_CODEX_MODEL",
+            "RTC_CODEX_FULL_AUTO",
+            "RTC_CODEX_SANDBOX_MODE",
             "RTC_REALTIME_URL",
             "RTC_ALLOW_CUSTOM_REALTIME_URL",
+            "RTC_REALTIME_SESSION_MODEL",
+            "RTC_REALTIME_MODEL",
             "RTC_TRANSCRIBE_MODEL",
             "RTC_TRANSCRIBE_LANGUAGE",
             "RTC_MAX_RPC_LINE_BYTES",
@@ -308,6 +321,10 @@ final class OrchestratorClient {
         _ = fcntl(socketFd, F_SETFL, flags | O_NONBLOCK)
 
         isConnected = true
+        isAuthenticated = false
+        authRequestId = nil
+        authRetryAttempted = false
+        pendingOutboundMessages.removeAll(keepingCapacity: false)
         startReading()
         authenticate()
     }
@@ -368,6 +385,10 @@ final class OrchestratorClient {
         }
 
         isConnected = false
+        isAuthenticated = false
+        authRequestId = nil
+        authRetryAttempted = false
+        pendingOutboundMessages.removeAll(keepingCapacity: false)
         readBuffer = Data()
         terminateLaunchedBackendIfNeeded()
     }
@@ -392,9 +413,9 @@ final class OrchestratorClient {
             onEvent?(.error(message: "Audio chunk too large; dropped"))
             return
         }
-        guard isConnected else { return }
+        guard isConnected, isAuthenticated else { return }
         queue.async { [weak self] in
-            guard let self = self, self.isConnected else { return }
+            guard let self = self, self.isConnected, self.isAuthenticated else { return }
             self.sendAudioNotification(base64Chunk)
         }
     }
@@ -403,7 +424,16 @@ final class OrchestratorClient {
 
     private func authenticate() {
         let id = nextId()
+        authRequestId = id
         sendRequest(id: id, method: "auth", params: ["token": authToken])
+    }
+
+    private static func readAuthTokenFromDisk(tokenPath: String) -> String? {
+        guard let fileToken = try? String(contentsOfFile: tokenPath, encoding: .utf8) else {
+            return nil
+        }
+        let trimmed = fileToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.count >= 16 ? trimmed : nil
     }
 
     private static func resolveAuthToken(explicitToken: String?, tokenPath: String) -> String {
@@ -414,14 +444,28 @@ final class OrchestratorClient {
             }
         }
 
-        if let fileToken = try? String(contentsOfFile: tokenPath, encoding: .utf8) {
-            let trimmed = fileToken.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.count >= 16 {
-                return trimmed
-            }
+        if let diskToken = readAuthTokenFromDisk(tokenPath: tokenPath) {
+            return diskToken
         }
 
         return UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+    }
+
+    private func refreshAuthTokenFromDisk() -> Bool {
+        guard let diskToken = Self.readAuthTokenFromDisk(tokenPath: authTokenPath) else {
+            return false
+        }
+        authToken = diskToken
+        return true
+    }
+
+    private func flushPendingOutboundMessages() {
+        guard isConnected, isAuthenticated, !pendingOutboundMessages.isEmpty else { return }
+        let queued = pendingOutboundMessages
+        pendingOutboundMessages.removeAll(keepingCapacity: false)
+        for message in queued {
+            sendJSON(message)
+        }
     }
 
     private func nextId() -> Int {
@@ -442,6 +486,11 @@ final class OrchestratorClient {
 
     private func sendJSON(_ object: [String: Any]) {
         guard isConnected else { return }
+        let method = object["method"] as? String
+        if !isAuthenticated && method != "auth" {
+            pendingOutboundMessages.append(object)
+            return
+        }
 
         queue.async { [weak self] in
             guard let self = self, self.isConnected else { return }
@@ -562,9 +611,39 @@ final class OrchestratorClient {
 
     private func handleMessage(_ json: [String: Any]) {
         // JSON-RPC response (has id) — check for errors
-        if json["id"] != nil {
-            if let error = json["error"] as? [String: Any],
-               let message = error["message"] as? String {
+        let responseId: Int? = {
+            if let intId = json["id"] as? Int { return intId }
+            if let numId = json["id"] as? NSNumber { return numId.intValue }
+            return nil
+        }()
+
+        if let responseId {
+            let errorMessage = (json["error"] as? [String: Any])?["message"] as? String
+
+            if responseId == authRequestId {
+                if let message = errorMessage {
+                    isAuthenticated = false
+                    authRequestId = nil
+
+                    if message == "Unauthorized: invalid token" && !authRetryAttempted && refreshAuthTokenFromDisk() {
+                        authRetryAttempted = true
+                        authenticate()
+                        return
+                    }
+
+                    pendingOutboundMessages.removeAll(keepingCapacity: false)
+                    onEvent?(.error(message: message))
+                    return
+                }
+
+                isAuthenticated = true
+                authRequestId = nil
+                authRetryAttempted = false
+                flushPendingOutboundMessages()
+                return
+            }
+
+            if let message = errorMessage {
                 onEvent?(.error(message: message))
             }
             return
@@ -600,6 +679,10 @@ final class OrchestratorClient {
 
     private func handleDisconnect() {
         isConnected = false
+        isAuthenticated = false
+        authRequestId = nil
+        authRetryAttempted = false
+        pendingOutboundMessages.removeAll(keepingCapacity: false)
         readSource?.cancel()
         readSource = nil
         if socketFd >= 0 {

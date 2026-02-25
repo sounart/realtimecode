@@ -10,6 +10,8 @@ Current transport is newline-delimited JSON-RPC 2.0 over a Unix domain socket.
 
 ## Event Types
 - `transcript`
-- `codex` (`tool_call`, `file_change`, `output`, `done`)
+- `codex` (`tool_call`, `file_change`, `done`)
 - `status`
 - `error`
+
+Codex textual output is streamed to the orchestrator process stdout (for terminal visibility) instead of being sent over socket events.

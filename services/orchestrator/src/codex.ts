@@ -1,6 +1,9 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { logger } from './logger.js';
 
+const DEFAULT_CODEX_MODEL = 'gpt-5.3-codex-spark';
+const DEFAULT_CODEX_SANDBOX_MODE = 'workspace-write';
+
 export interface CodexCallbacks {
   onToolCall: (tool: string, args: Record<string, unknown>) => void;
   onFileChange: (path: string, changeType: string) => void;
@@ -88,7 +91,16 @@ export class CodexRunner {
   }
 
   private buildArgs(): string[] {
-    const args = ['exec', '--full-auto', '--json'];
+    const args = ['exec', '--json'];
+    const model = process.env['RTC_CODEX_MODEL']?.trim() || DEFAULT_CODEX_MODEL;
+    const sandboxMode = process.env['RTC_CODEX_SANDBOX_MODE']?.trim() || DEFAULT_CODEX_SANDBOX_MODE;
+    const fullAuto = process.env['RTC_CODEX_FULL_AUTO'] !== '0';
+
+    if (fullAuto) {
+      args.push('--full-auto');
+    }
+    args.push('--sandbox', sandboxMode);
+    args.push('--model', model);
 
     if (process.env['RTC_CODEX_EPHEMERAL'] !== '0') {
       args.push('--ephemeral');

@@ -11,7 +11,7 @@ final class AppState: ObservableObject {
     @Published var isConnected = false
     @Published var statusText = "Ready"
     @Published var currentTranscript = ""
-    @Published var lastAction = ""
+    @Published var isCodexWorking = false
     @Published var selectedWorkdir: String
     @Published var hotkeyPreset: HotkeyPreset
     @Published var hotkeyEnabled = true
@@ -65,8 +65,10 @@ final class AppState: ObservableObject {
                 switch state {
                 case "listening":
                     self.statusText = "Listening..."
+                    self.isCodexWorking = false
                 case "executing":
                     self.statusText = "Executing..."
+                    self.isCodexWorking = true
                 case "idle":
                     if self.isRecording {
                         self.micService.stopCapture()
@@ -74,6 +76,7 @@ final class AppState: ObservableObject {
                         self.currentTranscript = ""
                     }
                     self.statusText = "Ready"
+                    self.isCodexWorking = false
                 default:
                     self.statusText = state.capitalized
                 }
@@ -81,26 +84,16 @@ final class AppState: ObservableObject {
             case .transcript(let text, let isFinal):
                 if isFinal {
                     self.currentTranscript = ""
-                    self.lastAction = text
                 } else {
                     self.currentTranscript = text
                 }
 
-            case .codex(let type, let data):
+            case .codex(let type, _):
                 switch type {
-                case "tool_call":
-                    let tool = data["tool"] as? String ?? ""
-                    self.lastAction = "Running \(tool)..."
-                case "file_change":
-                    let path = data["path"] as? String ?? ""
-                    let changeType = data["changeType"] as? String ?? "update"
-                    self.lastAction = "\(changeType.capitalized) \(path)"
-                case "output":
-                    let text = data["text"] as? String ?? ""
-                    if let status = self.codexStatusLine(from: text) {
-                        self.lastAction = status
-                    }
+                case "tool_call", "file_change":
+                    self.isCodexWorking = true
                 case "done":
+                    self.isCodexWorking = false
                     if self.statusText == "Executing..." {
                         self.statusText = "Listening..."
                     }
@@ -114,6 +107,7 @@ final class AppState: ObservableObject {
                     self.isRecording = false
                     self.currentTranscript = ""
                 }
+                self.isCodexWorking = false
                 self.statusText = "Error: \(message)"
                 print("[RealtimeCode] Error: \(message)")
             }
@@ -122,6 +116,7 @@ final class AppState: ObservableObject {
         orchestratorClient.onDisconnect = { [weak self] in
             guard let self = self else { return }
             self.isConnected = false
+            self.isCodexWorking = false
             self.statusText = "Disconnected"
             // Auto-reconnect if we were recording
             if self.isRecording {
@@ -132,50 +127,12 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func codexStatusLine(from raw: String) -> String? {
-        var plainFallback: String?
-        for line in raw.split(whereSeparator: \.isNewline) {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
-            if trimmed.contains("state db record_discrepancy") { continue }
-            if trimmed.hasPrefix("Reading prompt from stdin") { continue }
-
-            if let status = codexStatusFromJSONLine(trimmed) {
-                return status
-            }
-            if plainFallback == nil {
-                plainFallback = String(trimmed.prefix(160))
-            }
-        }
-        return plainFallback
-    }
-
-    private func codexStatusFromJSONLine(_ line: String) -> String? {
-        guard let data = line.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let type = json["type"] as? String else { return nil }
-
-        if type == "turn.started" {
-            return "Codex is thinking..."
-        }
-        if type == "turn.completed" {
-            return "Codex finished turn"
-        }
-        if type == "item.completed",
-           let item = json["item"] as? [String: Any],
-           let itemType = item["type"] as? String,
-           itemType == "agent_message",
-           let text = item["text"] as? String {
-            return String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(160))
-        }
-        return nil
-    }
-
     private func isStartupConfigurationError(_ message: String) -> Bool {
         if message == "OPENAI_API_KEY not set" { return true }
         if message == "Missing workdir param" { return true }
         if message == "Invalid workdir" { return true }
         if message.hasPrefix("Unauthorized:") { return true }
+        if message.lowercased().contains("not supported in realtime mode") { return true }
         if message.hasPrefix("Workdir ") { return true }
         return false
     }
@@ -195,6 +152,7 @@ final class AppState: ObservableObject {
     func stopRecording() {
         micService.stopCapture()
         isRecording = false
+        isCodexWorking = false
         orchestratorClient.stop()
         statusText = "Ready"
         currentTranscript = ""
@@ -310,12 +268,14 @@ struct RealtimeCodeMenuBarApp: App {
     }
 
     private var menuBarIcon: String {
-        if appState.isRecording {
-            return "mic.circle.fill"
+        if appState.isCodexWorking {
+            return "sparkles"
+        } else if appState.isRecording {
+            return "waveform"
         } else if appState.isConnected {
-            return "mic"
+            return "chevron.left.forwardslash.chevron.right"
         } else {
-            return "mic.slash"
+            return "bolt.slash"
         }
     }
 }
@@ -357,14 +317,7 @@ struct MenuContent: View {
             )
         }
 
-        if !appState.lastAction.isEmpty {
-            infoRow(
-                title: "Last Action",
-                systemImage: "sparkles",
-                text: appState.lastAction,
-                lineLimit: 2
-            )
-        }
+        codexActivityRow
 
         Divider()
 
@@ -531,6 +484,40 @@ struct MenuContent: View {
             return "Starting"
         }
         return appState.isConnected ? "Online" : "Offline"
+    }
+
+    private var codexActivityColor: Color {
+        appState.isCodexWorking ? .orange : .secondary
+    }
+
+    private var codexActivityRow: some View {
+        HStack(spacing: 8) {
+            codexActivityIndicator
+            Text(appState.isCodexWorking ? "Codex is working" : "Codex is idle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var codexActivityIndicator: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !appState.isCodexWorking)) { context in
+            let time = context.date.timeIntervalSinceReferenceDate
+            let phase = (sin(time * (.pi * 2.0 / 1.2)) + 1.0) / 2.0
+            let pulseScale = 1.0 + (0.35 * phase)
+
+            ZStack {
+                Circle()
+                    .fill(codexActivityColor.opacity(appState.isCodexWorking ? 0.28 : 0.16))
+                    .frame(width: 14, height: 14)
+                    .scaleEffect(appState.isCodexWorking ? pulseScale : 1.0)
+                Circle()
+                    .fill(codexActivityColor)
+                    .frame(width: 8, height: 8)
+            }
+        }
+        .frame(width: 16, height: 16)
+        .accessibilityLabel("Codex activity")
+        .accessibilityValue(appState.isCodexWorking ? "Working" : "Idle")
     }
 
     private var statusColor: Color {

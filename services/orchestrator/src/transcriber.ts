@@ -37,6 +37,8 @@ type ServerEvent =
   | { type: string };
 
 const DEFAULT_REALTIME_URL_BASE = 'wss://api.openai.com/v1/realtime';
+const DEFAULT_REALTIME_SESSION_MODEL = 'gpt-realtime';
+const DEFAULT_TRANSCRIPTION_MODEL = 'gpt-4o-transcribe';
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null;
@@ -49,8 +51,8 @@ function getErrorMessage(event: Record<string, unknown>): string {
   return nestedMsg ?? directMsg ?? 'Unknown realtime error';
 }
 
-function resolveRealtimeUrl(rawUrl: string | undefined, model: string): string {
-  const fallback = `${DEFAULT_REALTIME_URL_BASE}?model=${encodeURIComponent(model)}`;
+function resolveRealtimeUrl(rawUrl: string | undefined, sessionModel: string): string {
+  const fallback = `${DEFAULT_REALTIME_URL_BASE}?model=${encodeURIComponent(sessionModel)}`;
   if (!rawUrl) return fallback;
 
   let parsed: URL;
@@ -81,6 +83,10 @@ function resolveRealtimeUrl(rawUrl: string | undefined, model: string): string {
     }
   }
 
+  if (!parsed.searchParams.get('model')) {
+    parsed.searchParams.set('model', sessionModel);
+  }
+
   return parsed.toString();
 }
 
@@ -92,7 +98,8 @@ export class Transcriber {
 
   private ws: WebSocket | null = null;
   private readonly apiKey: string;
-  private readonly model: string;
+  private readonly transcriptionModel: string;
+  private readonly realtimeSessionModel: string;
   private readonly language: string | null;
   private readonly vadThreshold: number;
   private readonly silenceDurationMs: number;
@@ -119,16 +126,19 @@ export class Transcriber {
 
   constructor(options: TranscriberOptions, callbacks: TranscriberCallbacks) {
     this.apiKey = options.apiKey;
-    this.model = options.model
+    this.transcriptionModel = options.model
       ?? process.env['RTC_TRANSCRIBE_MODEL']
-      ?? 'gpt-4o-transcribe';
+      ?? DEFAULT_TRANSCRIPTION_MODEL;
+    this.realtimeSessionModel = process.env['RTC_REALTIME_SESSION_MODEL']
+      ?? process.env['RTC_REALTIME_MODEL']
+      ?? DEFAULT_REALTIME_SESSION_MODEL;
     this.language = options.language ?? process.env['RTC_TRANSCRIBE_LANGUAGE'] ?? null;
     this.vadThreshold = options.vadThreshold ?? 0.5;
     this.silenceDurationMs = options.silenceDurationMs ?? 800;
     this.prefixPaddingMs = options.prefixPaddingMs ?? 300;
     this.socketFactory = options.socketFactory
       ?? ((url: string, wsOptions?: object) => new WebSocket(url, wsOptions as never));
-    this.realtimeUrl = resolveRealtimeUrl(process.env['RTC_REALTIME_URL'], this.model);
+    this.realtimeUrl = resolveRealtimeUrl(process.env['RTC_REALTIME_URL'], this.realtimeSessionModel);
     this.cb = callbacks;
   }
 
@@ -213,7 +223,7 @@ export class Transcriber {
   }
 
   private sendSessionUpdate(): void {
-    const transcription: Record<string, unknown> = { model: this.model };
+    const transcription: Record<string, unknown> = { model: this.transcriptionModel };
     if (this.language) {
       transcription['language'] = this.language;
     }
@@ -221,7 +231,7 @@ export class Transcriber {
     this.send({
       type: 'session.update',
       session: {
-        type: 'transcription',
+        type: 'realtime',
         audio: {
           input: {
             format: { type: 'audio/pcm', rate: 24_000 },
@@ -231,6 +241,8 @@ export class Transcriber {
               threshold: this.vadThreshold,
               prefix_padding_ms: this.prefixPaddingMs,
               silence_duration_ms: this.silenceDurationMs,
+              create_response: false,
+              interrupt_response: false,
             },
             noise_reduction: { type: 'near_field' },
           },

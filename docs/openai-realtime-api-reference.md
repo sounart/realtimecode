@@ -15,10 +15,16 @@ Primary sources:
 
 ## WebSocket Connection
 
-Use a model-qualified Realtime URL:
+Use a model-qualified Realtime URL with a realtime session model:
 
 ```text
-wss://api.openai.com/v1/realtime?model=<realtime_or_transcription_model>
+wss://api.openai.com/v1/realtime?model=<realtime_session_model>
+```
+
+Example:
+
+```text
+wss://api.openai.com/v1/realtime?model=gpt-realtime
 ```
 
 Auth header:
@@ -35,7 +41,7 @@ After the socket opens, send `session.update`:
 {
   "type": "session.update",
   "session": {
-    "type": "transcription",
+    "type": "realtime",
     "audio": {
       "input": {
         "format": { "type": "audio/pcm", "rate": 24000 },
@@ -47,7 +53,9 @@ After the socket opens, send `session.update`:
           "type": "server_vad",
           "threshold": 0.5,
           "prefix_padding_ms": 300,
-          "silence_duration_ms": 800
+          "silence_duration_ms": 800,
+          "create_response": false,
+          "interrupt_response": false
         },
         "noise_reduction": { "type": "near_field" }
       }
@@ -57,8 +65,11 @@ After the socket opens, send `session.update`:
 ```
 
 Notes:
-- Keep mode as `transcription` for speech-to-text-only behavior.
+- Configure `audio.input.transcription` for speech-to-text behavior.
+- For this app's WebSocket flow, use `session.type = "realtime"` in `session.update`.
+- Keep the WebSocket URL model as a realtime model (for example `gpt-realtime`), and set the speech model in `audio.input.transcription.model`.
 - Setting `transcription.language` can improve latency/accuracy when known.
+- If you receive `Model \"...\" is not supported in realtime mode`, the URL model is likely set to a non-realtime model.
 
 ## Audio Format
 
@@ -85,5 +96,4 @@ Notes:
 ## Model Performance Notes
 
 - `gpt-4o-mini-transcribe` is available as a lower-latency/cost option.
-- `gpt-4o-transcribe` is the higher-accuracy default.
-
+- `gpt-4o-transcribe` is the higher-accuracy default for this app.

@@ -69,8 +69,12 @@ describe('CodexRunner', () => {
     expect(spawnMock.mock.calls[0]?.[0]).toBe('codex');
     expect(spawnMock.mock.calls[0]?.[1]).toEqual([
       'exec',
-      '--full-auto',
       '--json',
+      '--full-auto',
+      '--sandbox',
+      'workspace-write',
+      '--model',
+      'gpt-5.3-codex-spark',
       '--ephemeral',
     ]);
     expect(Buffer.concat(stdinChunks).toString('utf8')).toBe('test prompt\n');
@@ -83,6 +87,9 @@ describe('CodexRunner', () => {
   it('allows overriding optional codex flags through env vars', () => {
     vi.stubEnv('RTC_CODEX_EPHEMERAL', '0');
     vi.stubEnv('RTC_CODEX_SKIP_GIT_REPO_CHECK', '1');
+    vi.stubEnv('RTC_CODEX_MODEL', 'gpt-5.3-codex');
+    vi.stubEnv('RTC_CODEX_FULL_AUTO', '0');
+    vi.stubEnv('RTC_CODEX_SANDBOX_MODE', 'read-only');
 
     const proc = queueProcess();
     const runner = new CodexRunner();
@@ -93,8 +100,11 @@ describe('CodexRunner', () => {
     expect(spawnMock).toHaveBeenCalledTimes(1);
     expect(spawnMock.mock.calls[0]?.[1]).toEqual([
       'exec',
-      '--full-auto',
       '--json',
+      '--sandbox',
+      'read-only',
+      '--model',
+      'gpt-5.3-codex',
       '--skip-git-repo-check',
     ]);
 

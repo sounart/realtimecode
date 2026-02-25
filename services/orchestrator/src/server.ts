@@ -165,7 +165,7 @@ function executeInstruction(text: string): void {
       notify('codex', { type: 'file_change', data: { path: filePath, changeType } });
     },
     onOutput(output) {
-      notify('codex', { type: 'output', data: { text: output } });
+      process.stdout.write(output);
     },
     onDone() {
       notify('codex', { type: 'done', data: {} });
@@ -316,11 +316,25 @@ async function readAuthTokenFromDisk(tokenPath: string): Promise<string | null> 
   }
 }
 
+async function persistAuthTokenToDisk(token: string): Promise<void> {
+  await fs.mkdir(SOCKET_DIR, { recursive: true, mode: 0o700 });
+  await fs.chmod(SOCKET_DIR, 0o700).catch(() => {
+    logger.warn('failed to enforce socket directory permissions', { socketDir: SOCKET_DIR });
+  });
+  await fs.writeFile(AUTH_TOKEN_PATH, `${token}\n`, { mode: 0o600 });
+  await fs.chmod(AUTH_TOKEN_PATH, 0o600).catch(() => {
+    logger.warn('failed to enforce auth token file permissions', { authTokenPath: AUTH_TOKEN_PATH });
+  });
+}
+
 async function resolveAuthToken(): Promise<string | null> {
   if (!AUTH_REQUIRED) return null;
 
   const envToken = process.env['RTC_AUTH_TOKEN']?.trim();
-  if (envToken && envToken.length >= 16) return envToken;
+  if (envToken && envToken.length >= 16) {
+    await persistAuthTokenToDisk(envToken);
+    return envToken;
+  }
 
   await fs.mkdir(SOCKET_DIR, { recursive: true, mode: 0o700 });
   await fs.chmod(SOCKET_DIR, 0o700).catch(() => {
@@ -342,7 +356,6 @@ async function resolveAuthToken(): Promise<string | null> {
       throw err;
     }
   }
-
   await fs.chmod(AUTH_TOKEN_PATH, 0o600).catch(() => {
     logger.warn('failed to enforce auth token file permissions', { authTokenPath: AUTH_TOKEN_PATH });
   });
