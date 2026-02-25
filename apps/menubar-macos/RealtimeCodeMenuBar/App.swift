@@ -12,6 +12,13 @@ final class AppState: ObservableObject {
     @Published var statusText = "Ready"
     @Published var currentTranscript = ""
     @Published var isCodexWorking = false
+    @Published var codexInstalledVersion: String?
+    @Published var codexLatestVersion: String?
+    @Published var codexUpdateAvailable = false
+    @Published var codexUpdateDetail: String?
+    @Published var isCheckingCodexUpdate = false
+    @Published var isUpdatingCodex = false
+    @Published private(set) var hasCheckedCodexUpdate = false
     @Published var selectedWorkdir: String
     @Published var hotkeyPreset: HotkeyPreset
     @Published var hotkeyEnabled = true
@@ -34,6 +41,7 @@ final class AppState: ObservableObject {
         setupMicService()
         setupHotkeyManager()
         setupOrchestratorClient()
+        refreshCodexUpdateStatus()
     }
 
     // MARK: - Setup
@@ -242,6 +250,78 @@ final class AppState: ObservableObject {
         hotkeyManager.stopListening()
         NSApplication.shared.terminate(nil)
     }
+
+    func refreshCodexUpdateStatus() {
+        if isCheckingCodexUpdate || isUpdatingCodex { return }
+        isCheckingCodexUpdate = true
+        codexUpdateDetail = nil
+
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let status = CodexUpdateService.checkStatus()
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.isCheckingCodexUpdate = false
+                self.codexInstalledVersion = status.installedVersion
+                self.codexLatestVersion = status.latestVersion
+                self.codexUpdateAvailable = status.availability == .updateAvailable
+                self.codexUpdateDetail = status.message
+                self.hasCheckedCodexUpdate = true
+            }
+        }
+    }
+
+    func installOrUpdateCodex() {
+        if isUpdatingCodex { return }
+        isUpdatingCodex = true
+        codexUpdateDetail = "Updating Codex CLI..."
+
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result = CodexUpdateService.updateToLatest()
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.isUpdatingCodex = false
+                self.codexUpdateDetail = result.message
+                self.refreshCodexUpdateStatus()
+            }
+        }
+    }
+
+    var shouldShowCodexUpdateNotification: Bool {
+        (hasCheckedCodexUpdate && (codexUpdateAvailable || codexInstalledVersion == nil)) || isUpdatingCodex
+    }
+
+    var codexUpdateHeadline: String {
+        if isCheckingCodexUpdate {
+            return "Checking Codex CLI..."
+        }
+        if isUpdatingCodex {
+            return "Updating Codex CLI..."
+        }
+        if codexInstalledVersion == nil {
+            return "Codex CLI not installed"
+        }
+        if codexUpdateAvailable {
+            return "Codex update available"
+        }
+        return "Codex CLI"
+    }
+
+    var codexUpdateSummary: String {
+        if let installed = codexInstalledVersion, let latest = codexLatestVersion, installed != latest {
+            return "Installed \(installed) • Latest \(latest)"
+        }
+        if let installed = codexInstalledVersion {
+            return "Installed \(installed)"
+        }
+        if let latest = codexLatestVersion {
+            return "Latest \(latest)"
+        }
+        return "Install @openai/codex to run commands"
+    }
+
+    var codexUpdateButtonTitle: String {
+        codexInstalledVersion == nil ? "Install Codex" : "Update Codex"
+    }
 }
 
 // MARK: - App Entry Point
@@ -318,6 +398,10 @@ struct MenuContent: View {
         }
 
         codexActivityRow
+
+        if appState.shouldShowCodexUpdateNotification {
+            codexUpdateNotificationRow
+        }
 
         Divider()
 
@@ -497,6 +581,60 @@ struct MenuContent: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
+    }
+
+    private var codexUpdateNotificationRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: codexUpdateIconName)
+                    .foregroundStyle(codexUpdateColor)
+                Text(appState.codexUpdateHeadline)
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                Spacer()
+                if appState.isCheckingCodexUpdate || appState.isUpdatingCodex {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+
+            Text(appState.codexUpdateSummary)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            if let detail = appState.codexUpdateDetail, !detail.isEmpty {
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack(spacing: 8) {
+                Button(appState.codexUpdateButtonTitle) {
+                    appState.installOrUpdateCodex()
+                }
+                .disabled(appState.isUpdatingCodex)
+
+                Button("Check Again") {
+                    appState.refreshCodexUpdateStatus()
+                }
+                .disabled(appState.isCheckingCodexUpdate || appState.isUpdatingCodex)
+            }
+        }
+    }
+
+    private var codexUpdateIconName: String {
+        if appState.codexInstalledVersion == nil {
+            return "exclamationmark.triangle.fill"
+        }
+        return appState.codexUpdateAvailable ? "arrow.triangle.2.circlepath.circle.fill" : "checkmark.circle.fill"
+    }
+
+    private var codexUpdateColor: Color {
+        if appState.codexInstalledVersion == nil {
+            return .red
+        }
+        return appState.codexUpdateAvailable ? .orange : .green
     }
 
     private var codexActivityIndicator: some View {
