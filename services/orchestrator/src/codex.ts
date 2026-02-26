@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { logger } from './logger.js';
 
 const DEFAULT_CODEX_MODEL = 'gpt-5.3-codex-spark';
-const DEFAULT_CODEX_SANDBOX_MODE = 'workspace-write';
+const DEFAULT_CODEX_SANDBOX_MODE = 'danger-full-access';
 
 export interface CodexCallbacks {
   onToolCall: (tool: string, args: Record<string, unknown>) => void;
@@ -36,6 +36,12 @@ function parseKillGraceMs(raw: string | undefined): number {
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed < 100) return fallback;
   return Math.floor(parsed);
+}
+
+function parseEnabled(raw: string | undefined): boolean {
+  if (!raw) return false;
+  const normalized = raw.trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
 }
 
 export class CodexRunner {
@@ -93,15 +99,30 @@ export class CodexRunner {
   }
 
   private buildArgs(): string[] {
-    const args = ['exec', '--json'];
+    const args = ['--ask-for-approval', 'never', 'exec', '--json'];
     const model = process.env['RTC_CODEX_MODEL']?.trim() || DEFAULT_CODEX_MODEL;
     const sandboxMode = process.env['RTC_CODEX_SANDBOX_MODE']?.trim() || DEFAULT_CODEX_SANDBOX_MODE;
-    const fullAuto = process.env['RTC_CODEX_FULL_AUTO'] !== '0';
+    const dangerouslyBypassApprovalsAndSandbox = process.env['RTC_CODEX_DANGEROUSLY_BYPASS_SANDBOX'] !== '0';
+    const fullAutoRequested = parseEnabled(process.env['RTC_CODEX_FULL_AUTO']);
 
-    if (fullAuto) {
-      args.push('--full-auto');
+    if (dangerouslyBypassApprovalsAndSandbox) {
+      if (fullAutoRequested) {
+        logger.warn('ignoring RTC_CODEX_FULL_AUTO because dangerous sandbox bypass is enabled');
+      }
+      args.push('--dangerously-bypass-approvals-and-sandbox');
+    } else {
+      const fullAuto = fullAutoRequested && sandboxMode === 'workspace-write';
+      if (fullAutoRequested && !fullAuto) {
+        logger.warn('ignoring RTC_CODEX_FULL_AUTO because sandbox mode is not workspace-write', {
+          sandboxMode,
+        });
+      }
+
+      if (fullAuto) {
+        args.push('--full-auto');
+      }
+      args.push('--sandbox', sandboxMode);
     }
-    args.push('--sandbox', sandboxMode);
     args.push('--model', model);
 
     if (process.env['RTC_CODEX_EPHEMERAL'] !== '0') {

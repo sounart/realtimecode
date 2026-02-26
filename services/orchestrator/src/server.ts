@@ -58,6 +58,21 @@ const TRANSCRIPT_DEDUPE_WINDOW_MS = parseBoundedInt(
   500,
   30_000,
 );
+const DEFAULT_CODEX_INSTRUCTION_PREFIX = [
+  'Execution policy:',
+  '- Assume macOS/BSD userland unless proven otherwise.',
+  '- Do not use Linux-only helpers like `timeout` or `setsid`.',
+  '- For `ps`, use BSD-safe fields like `pid=,ppid=,stat=,command=` (not `cmd=`).',
+  '- If a request asks to start or run a long-lived process (server/dev watcher/daemon), DO NOT rely on plain `nohup ... &`.',
+  '- Use a robust detached spawn with Node: `node -e` + `child_process.spawn(..., { detached: true, stdio: ["ignore", out, err] })` and `child.unref()`.',
+  '- Persist process metadata: write PID file and log file paths.',
+  '- After launch, verify from a separate command with retry (for example: `lsof` and `curl`) before reporting success.',
+  '- Include PID file path, log path, and verification result in your final response.',
+  '- If verification fails, inspect logs/process state and retry with corrected launch strategy instead of asking the user.',
+  '- Do not ask clarifying questions when the user intent is actionable; execute directly and report what happened.',
+].join('\n');
+const CODEX_INSTRUCTION_PREFIX = process.env['RTC_CODEX_INSTRUCTION_PREFIX']?.trim()
+  || DEFAULT_CODEX_INSTRUCTION_PREFIX;
 const FILLER_WORDS = new Set([
   'ah',
   'eh',
@@ -332,6 +347,7 @@ function executeInstruction(text: string): void {
   if (!workdir) return;
 
   const normalized = normalizeText(text);
+  const codexInstruction = `${CODEX_INSTRUCTION_PREFIX}\n\nUser request:\n${normalized}`;
   const meta: Record<string, unknown> = {
     chars: normalized.length,
     queueDepth: pendingInstructions.length,
@@ -343,7 +359,7 @@ function executeInstruction(text: string): void {
 
   setState('executing');
 
-  codex.run(normalized, workdir, {
+  codex.run(codexInstruction, workdir, {
     onToolCall(tool, args) {
       notify('codex', { type: 'tool_call', data: { tool, args } });
     },

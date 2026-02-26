@@ -56,7 +56,7 @@ beforeEach(() => {
 });
 
 describe('CodexRunner', () => {
-  it('spawns codex with stdin prompt and defaults to ephemeral mode', () => {
+  it('spawns codex with stdin prompt and defaults to dangerous sandbox bypass', () => {
     const proc = queueProcess();
     const runner = new CodexRunner();
     const cb = callbacks();
@@ -68,11 +68,11 @@ describe('CodexRunner', () => {
     expect(spawnMock).toHaveBeenCalledTimes(1);
     expect(spawnMock.mock.calls[0]?.[0]).toBe('codex');
     expect(spawnMock.mock.calls[0]?.[1]).toEqual([
+      '--ask-for-approval',
+      'never',
       'exec',
       '--json',
-      '--full-auto',
-      '--sandbox',
-      'workspace-write',
+      '--dangerously-bypass-approvals-and-sandbox',
       '--model',
       'gpt-5.3-codex-spark',
       '--ephemeral',
@@ -85,10 +85,10 @@ describe('CodexRunner', () => {
   });
 
   it('allows overriding optional codex flags through env vars', () => {
+    vi.stubEnv('RTC_CODEX_DANGEROUSLY_BYPASS_SANDBOX', '0');
     vi.stubEnv('RTC_CODEX_EPHEMERAL', '0');
     vi.stubEnv('RTC_CODEX_SKIP_GIT_REPO_CHECK', '1');
     vi.stubEnv('RTC_CODEX_MODEL', 'gpt-5.3-codex');
-    vi.stubEnv('RTC_CODEX_FULL_AUTO', '0');
     vi.stubEnv('RTC_CODEX_SANDBOX_MODE', 'read-only');
 
     const proc = queueProcess();
@@ -99,6 +99,8 @@ describe('CodexRunner', () => {
 
     expect(spawnMock).toHaveBeenCalledTimes(1);
     expect(spawnMock.mock.calls[0]?.[1]).toEqual([
+      '--ask-for-approval',
+      'never',
       'exec',
       '--json',
       '--sandbox',
@@ -106,6 +108,91 @@ describe('CodexRunner', () => {
       '--model',
       'gpt-5.3-codex',
       '--skip-git-repo-check',
+    ]);
+
+    proc.emit('close', 0, null);
+    expect(cb.onDone).toHaveBeenCalledTimes(1);
+    expect(cb.onError).not.toHaveBeenCalled();
+  });
+
+  it('enables full-auto only when explicitly requested with workspace-write sandbox', () => {
+    vi.stubEnv('RTC_CODEX_DANGEROUSLY_BYPASS_SANDBOX', '0');
+    vi.stubEnv('RTC_CODEX_FULL_AUTO', '1');
+    vi.stubEnv('RTC_CODEX_SANDBOX_MODE', 'workspace-write');
+
+    const proc = queueProcess();
+    const runner = new CodexRunner();
+    const cb = callbacks();
+
+    runner.run('go', '/tmp', cb);
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(spawnMock.mock.calls[0]?.[1]).toEqual([
+      '--ask-for-approval',
+      'never',
+      'exec',
+      '--json',
+      '--full-auto',
+      '--sandbox',
+      'workspace-write',
+      '--model',
+      'gpt-5.3-codex-spark',
+      '--ephemeral',
+    ]);
+
+    proc.emit('close', 0, null);
+    expect(cb.onDone).toHaveBeenCalledTimes(1);
+    expect(cb.onError).not.toHaveBeenCalled();
+  });
+
+  it('ignores full-auto request when sandbox is not workspace-write', () => {
+    vi.stubEnv('RTC_CODEX_DANGEROUSLY_BYPASS_SANDBOX', '0');
+    vi.stubEnv('RTC_CODEX_FULL_AUTO', '1');
+    vi.stubEnv('RTC_CODEX_SANDBOX_MODE', 'danger-full-access');
+
+    const proc = queueProcess();
+    const runner = new CodexRunner();
+    const cb = callbacks();
+
+    runner.run('go', '/tmp', cb);
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(spawnMock.mock.calls[0]?.[1]).toEqual([
+      '--ask-for-approval',
+      'never',
+      'exec',
+      '--json',
+      '--sandbox',
+      'danger-full-access',
+      '--model',
+      'gpt-5.3-codex-spark',
+      '--ephemeral',
+    ]);
+
+    proc.emit('close', 0, null);
+    expect(cb.onDone).toHaveBeenCalledTimes(1);
+    expect(cb.onError).not.toHaveBeenCalled();
+  });
+
+  it('ignores full-auto when dangerous sandbox bypass is enabled', () => {
+    vi.stubEnv('RTC_CODEX_FULL_AUTO', '1');
+
+    const proc = queueProcess();
+    const runner = new CodexRunner();
+    const cb = callbacks();
+
+    runner.run('go', '/tmp', cb);
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(spawnMock.mock.calls[0]?.[1]).toEqual([
+      '--ask-for-approval',
+      'never',
+      'exec',
+      '--json',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--model',
+      'gpt-5.3-codex-spark',
+      '--ephemeral',
     ]);
 
     proc.emit('close', 0, null);
