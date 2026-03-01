@@ -1,5 +1,18 @@
 import WebSocket from 'ws';
 import { logger } from './logger.js';
+import {
+  DEFAULT_REALTIME_URL_BASE,
+  DEFAULT_REALTIME_SESSION_MODEL,
+  DEFAULT_TRANSCRIPTION_MODEL,
+  TRANSCRIPTION_MODEL_PATTERN,
+  MAX_PENDING_AUDIO_CHUNKS,
+  MAX_TRACKED_EMITTED_ITEMS,
+  DEFAULT_VAD_THRESHOLD,
+  DEFAULT_SILENCE_DURATION_MS,
+  DEFAULT_PREFIX_PADDING_MS,
+  MAX_RECONNECT_ATTEMPTS,
+  MAX_RECONNECT_DELAY_MS,
+} from './config.js';
 
 export interface TranscriberCallbacks {
   onPartialTranscript: (text: string) => void;
@@ -35,11 +48,6 @@ type ServerEvent =
   | { type: 'response.audio_transcript.done'; item_id?: string; transcript: string }
   | { type: 'error'; error?: { message?: string }; message?: string }
   | { type: string };
-
-const DEFAULT_REALTIME_URL_BASE = 'wss://api.openai.com/v1/realtime';
-const DEFAULT_REALTIME_SESSION_MODEL = 'gpt-realtime';
-const DEFAULT_TRANSCRIPTION_MODEL = 'gpt-4o-transcribe';
-const TRANSCRIPTION_MODEL_PATTERN = /^(whisper-1|gpt-4o(?:-mini)?-transcribe(?:-\d{4}-\d{2}-\d{2})?)$/;
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null;
@@ -119,8 +127,6 @@ function normalizeTranscriptionModel(rawModel: string | undefined): string {
 }
 
 export class Transcriber {
-  private static readonly MAX_PENDING_AUDIO_CHUNKS = 64;
-  private static readonly MAX_TRACKED_EMITTED_ITEMS = 2_048;
   private static readonly AUDIO_APPEND_PREFIX = '{"type":"input_audio_buffer.append","audio":"';
   private static readonly AUDIO_APPEND_SUFFIX = '"}';
 
@@ -162,9 +168,9 @@ export class Transcriber {
       ?? process.env['RTC_REALTIME_MODEL'],
     );
     this.language = options.language ?? process.env['RTC_TRANSCRIBE_LANGUAGE'] ?? null;
-    this.vadThreshold = options.vadThreshold ?? 0.5;
-    this.silenceDurationMs = options.silenceDurationMs ?? 800;
-    this.prefixPaddingMs = options.prefixPaddingMs ?? 300;
+    this.vadThreshold = options.vadThreshold ?? DEFAULT_VAD_THRESHOLD;
+    this.silenceDurationMs = options.silenceDurationMs ?? DEFAULT_SILENCE_DURATION_MS;
+    this.prefixPaddingMs = options.prefixPaddingMs ?? DEFAULT_PREFIX_PADDING_MS;
     this.socketFactory = options.socketFactory
       ?? ((url: string, wsOptions?: object) => new WebSocket(url, wsOptions as never));
     this.realtimeUrl = resolveRealtimeUrl(process.env['RTC_REALTIME_URL'], this.realtimeSessionModel);
@@ -229,7 +235,7 @@ export class Transcriber {
 
     // Buffer early audio while websocket/session handshake completes.
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
-      if (this.pendingAudioChunks.length >= Transcriber.MAX_PENDING_AUDIO_CHUNKS) {
+      if (this.pendingAudioChunks.length >= MAX_PENDING_AUDIO_CHUNKS) {
         this.pendingAudioChunks.shift();
       }
       this.pendingAudioChunks.push(base64);
@@ -433,9 +439,9 @@ export class Transcriber {
     this.emittedItemOrder.push(itemId);
 
     const trackedCount = this.emittedItemOrder.length - this.emittedItemHead;
-    if (trackedCount <= Transcriber.MAX_TRACKED_EMITTED_ITEMS) return;
+    if (trackedCount <= MAX_TRACKED_EMITTED_ITEMS) return;
 
-    const overflow = trackedCount - Transcriber.MAX_TRACKED_EMITTED_ITEMS;
+    const overflow = trackedCount - MAX_TRACKED_EMITTED_ITEMS;
     for (let i = 0; i < overflow; i += 1) {
       const staleId = this.emittedItemOrder[this.emittedItemHead];
       this.emittedItemHead += 1;
@@ -462,13 +468,13 @@ export class Transcriber {
   private scheduleReconnect(): void {
     if (!this.shouldReconnect || this.reconnectTimer) return;
 
-    if (this.reconnectAttempts >= 5) {
+    if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
       this.cb.onError(new Error('Realtime websocket reconnect attempts exhausted'));
       return;
     }
 
     this.reconnectAttempts += 1;
-    const delayMs = Math.min(1000 * 2 ** (this.reconnectAttempts - 1), 30_000);
+    const delayMs = Math.min(1000 * 2 ** (this.reconnectAttempts - 1), MAX_RECONNECT_DELAY_MS);
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;

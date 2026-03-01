@@ -1,8 +1,11 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { logger } from './logger.js';
-
-const DEFAULT_CODEX_MODEL = 'gpt-5.3-codex-spark';
-const DEFAULT_CODEX_SANDBOX_MODE = 'danger-full-access';
+import {
+  DEFAULT_CODEX_MODEL,
+  DEFAULT_CODEX_SANDBOX_MODE,
+  CODEX_TIMEOUT_MS,
+  CODEX_KILL_GRACE_MS,
+} from './config.js';
 
 export interface CodexCallbacks {
   onToolCall: (tool: string, args: Record<string, unknown>) => void;
@@ -22,22 +25,6 @@ interface SpawnContext {
   startedAtMs: number;
 }
 
-function parseTimeoutMs(raw: string | undefined): number {
-  const fallback = 120_000;
-  if (!raw) return fallback;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 10_000) return fallback;
-  return Math.floor(parsed);
-}
-
-function parseKillGraceMs(raw: string | undefined): number {
-  const fallback = 1_500;
-  if (!raw) return fallback;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 100) return fallback;
-  return Math.floor(parsed);
-}
-
 function parseEnabled(raw: string | undefined): boolean {
   if (!raw) return false;
   const normalized = raw.trim().toLowerCase();
@@ -47,7 +34,7 @@ function parseEnabled(raw: string | undefined): boolean {
 export class CodexRunner {
   private active: SpawnContext | null = null;
   private nextRunId = 1;
-  private readonly killGraceMs = parseKillGraceMs(process.env['RTC_CODEX_KILL_GRACE_MS']);
+  private readonly killGraceMs = CODEX_KILL_GRACE_MS;
 
   cancel(): void {
     const active = this.active;
@@ -158,7 +145,7 @@ export class CodexRunner {
 
     let buffer = '';
 
-    const timeoutMs = parseTimeoutMs(process.env['RTC_CODEX_TIMEOUT_MS']);
+    const timeoutMs = CODEX_TIMEOUT_MS;
     const ctx: SpawnContext = {
       proc,
       timeout: setTimeout(() => {

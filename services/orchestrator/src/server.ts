@@ -1,108 +1,28 @@
 import net from 'node:net';
 import { promises as fs } from 'node:fs';
-import path from 'node:path';
-import os from 'node:os';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import type { SessionState, JsonRpcRequest, JsonRpcResponse, JsonRpcNotification } from './types.js';
 import { Transcriber } from './transcriber.js';
 import { CodexRunner } from './codex.js';
 import { validateWorkdir } from './workdir.js';
 import { getLogPath, logger } from './logger.js';
-
-const SOCKET_PATH = process.env['RTC_SOCKET_PATH']
-  ?? path.join(os.homedir(), '.runtime', 'realtimecode', 'orchestrator.sock');
-const SOCKET_DIR = path.dirname(SOCKET_PATH);
-const AUTH_REQUIRED = process.env['RTC_AUTH_REQUIRED'] !== '0';
-const AUTH_TOKEN_PATH = process.env['RTC_AUTH_TOKEN_PATH']
-  ?? path.join(SOCKET_DIR, 'orchestrator.token');
-const MAX_RPC_LINE_BYTES = parseBoundedInt(
-  process.env['RTC_MAX_RPC_LINE_BYTES'],
-  1_048_576,
-  8_192,
-  8_388_608,
-);
-const MAX_AUDIO_CHUNK_BASE64_CHARS = parseBoundedInt(
-  process.env['RTC_MAX_AUDIO_CHUNK_BASE64_CHARS'],
-  256_000,
-  4_096,
-  2_000_000,
-);
-const LOG_INSTRUCTION_PREVIEW = process.env['RTC_LOG_INSTRUCTION_PREVIEW'] === '1';
-const TRANSCRIPT_COMMIT_DELAY_MS = parseBoundedInt(
-  process.env['RTC_TRANSCRIPT_COMMIT_DELAY_MS'],
-  750,
-  100,
-  5_000,
-);
-const MIN_EXECUTABLE_TRANSCRIPT_CHARS = parseBoundedInt(
-  process.env['RTC_MIN_EXECUTABLE_TRANSCRIPT_CHARS'],
-  8,
-  1,
-  200,
-);
-const MIN_EXECUTABLE_TRANSCRIPT_WORDS = parseBoundedInt(
-  process.env['RTC_MIN_EXECUTABLE_TRANSCRIPT_WORDS'],
-  2,
-  1,
-  20,
-);
-const MAX_PENDING_INSTRUCTIONS = parseBoundedInt(
-  process.env['RTC_MAX_PENDING_INSTRUCTIONS'],
-  8,
-  1,
-  128,
-);
-const TRANSCRIPT_DEDUPE_WINDOW_MS = parseBoundedInt(
-  process.env['RTC_TRANSCRIPT_DEDUPE_WINDOW_MS'],
-  4_000,
-  500,
-  30_000,
-);
-const DEFAULT_CODEX_INSTRUCTION_PREFIX = [
-  'Execution policy:',
-  '- Assume macOS/BSD userland unless proven otherwise.',
-  '- Do not use Linux-only helpers like `timeout` or `setsid`.',
-  '- For `ps`, use BSD-safe fields like `pid=,ppid=,stat=,command=` (not `cmd=`).',
-  '- If a request asks to start or run a long-lived process (server/dev watcher/daemon), DO NOT rely on plain `nohup ... &`.',
-  '- Use a robust detached spawn with Node: `node -e` + `child_process.spawn(..., { detached: true, stdio: ["ignore", out, err] })` and `child.unref()`.',
-  '- Persist process metadata: write PID file and log file paths.',
-  '- After launch, verify from a separate command with retry (for example: `lsof` and `curl`) before reporting success.',
-  '- Include PID file path, log path, and verification result in your final response.',
-  '- If verification fails, inspect logs/process state and retry with corrected launch strategy instead of asking the user.',
-  '- Do not ask clarifying questions when the user intent is actionable; execute directly and report what happened.',
-].join('\n');
-const CODEX_INSTRUCTION_PREFIX = process.env['RTC_CODEX_INSTRUCTION_PREFIX']?.trim()
-  || DEFAULT_CODEX_INSTRUCTION_PREFIX;
-const FILLER_WORDS = new Set([
-  'ah',
-  'eh',
-  'er',
-  'hmm',
-  'huh',
-  'mm',
-  'mmm',
-  'uh',
-  'uhh',
-  'um',
-]);
-const SHORT_COMMAND_WORDS = new Set([
-  'add',
-  'build',
-  'cancel',
-  'commit',
-  'continue',
-  'deploy',
-  'fix',
-  'lint',
-  'pull',
-  'push',
-  'quit',
-  'run',
-  'start',
-  'status',
-  'stop',
-  'test',
-]);
+import {
+  SOCKET_PATH,
+  SOCKET_DIR,
+  AUTH_REQUIRED,
+  AUTH_TOKEN_PATH,
+  MAX_RPC_LINE_BYTES,
+  MAX_AUDIO_CHUNK_BASE64_CHARS,
+  LOG_INSTRUCTION_PREVIEW,
+  TRANSCRIPT_COMMIT_DELAY_MS,
+  MIN_EXECUTABLE_TRANSCRIPT_CHARS,
+  MIN_EXECUTABLE_TRANSCRIPT_WORDS,
+  MAX_PENDING_INSTRUCTIONS,
+  TRANSCRIPT_DEDUPE_WINDOW_MS,
+  CODEX_INSTRUCTION_PREFIX,
+  FILLER_WORDS,
+  SHORT_COMMAND_WORDS,
+} from './config.js';
 
 let state: SessionState = 'idle';
 let workdir: string | null = null;
@@ -118,20 +38,6 @@ let transcriptParts: string[] = [];
 let transcriptCommitTimer: NodeJS.Timeout | null = null;
 let lastQueuedInstruction = '';
 let lastQueuedAtMs = 0;
-
-function parseBoundedInt(
-  raw: string | undefined,
-  fallback: number,
-  min: number,
-  max: number,
-): number {
-  if (!raw) return fallback;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed)) return fallback;
-  const intVal = Math.floor(parsed);
-  if (intVal < min || intVal > max) return fallback;
-  return intVal;
-}
 
 function isSocketAuthenticated(socket: net.Socket): boolean {
   return !AUTH_REQUIRED || authenticatedSockets.has(socket);
