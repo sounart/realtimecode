@@ -36,6 +36,7 @@ function callbacks(): CodexCallbacks {
   return {
     onToolCall: vi.fn(),
     onFileChange: vi.fn(),
+    onAssistantMessage: vi.fn(),
     onOutput: vi.fn(),
     onDone: vi.fn(),
     onError: vi.fn(),
@@ -197,6 +198,86 @@ describe('CodexRunner', () => {
 
     proc.emit('close', 0, null);
     expect(cb.onDone).toHaveBeenCalledTimes(1);
+    expect(cb.onError).not.toHaveBeenCalled();
+  });
+
+  it('emits only the final assistant message on successful completion', () => {
+    const proc = queueProcess();
+    const runner = new CodexRunner();
+    const cb = callbacks();
+
+    runner.run('summarize', '/tmp', cb);
+
+    proc.stdout.write('{"type":"item.completed","item":{"type":"agent_message","text":"first"}}\n');
+    proc.stdout.write('{"type":"item.completed","item":{"type":"agent_message","text":"second"}}\n');
+    proc.emit('close', 0, null);
+
+    expect(cb.onAssistantMessage).toHaveBeenCalledTimes(1);
+    expect(cb.onAssistantMessage).toHaveBeenCalledWith('second');
+    expect(cb.onDone).toHaveBeenCalledTimes(1);
+    expect(cb.onError).not.toHaveBeenCalled();
+    expect(cb.onOutput).toHaveBeenCalledTimes(2);
+  });
+
+  it('captures assistant messages from direct assistant_message events', () => {
+    const proc = queueProcess();
+    const runner = new CodexRunner();
+    const cb = callbacks();
+
+    runner.run('summarize', '/tmp', cb);
+
+    proc.stdout.write('{"type":"assistant_message","text":"direct summary"}\n');
+    proc.emit('close', 0, null);
+
+    expect(cb.onAssistantMessage).toHaveBeenCalledTimes(1);
+    expect(cb.onAssistantMessage).toHaveBeenCalledWith('direct summary');
+    expect(cb.onDone).toHaveBeenCalledTimes(1);
+    expect(cb.onError).not.toHaveBeenCalled();
+  });
+
+  it('captures assistant messages from nested content arrays', () => {
+    const proc = queueProcess();
+    const runner = new CodexRunner();
+    const cb = callbacks();
+
+    runner.run('summarize', '/tmp', cb);
+
+    proc.stdout.write('{"type":"item.completed","item":{"type":"assistant_message","content":[{"type":"output_text","text":"first"},{"type":"output_text","text":"second"}]}}\n');
+    proc.emit('close', 0, null);
+
+    expect(cb.onAssistantMessage).toHaveBeenCalledTimes(1);
+    expect(cb.onAssistantMessage).toHaveBeenCalledWith('first second');
+    expect(cb.onDone).toHaveBeenCalledTimes(1);
+    expect(cb.onError).not.toHaveBeenCalled();
+  });
+
+  it('emits final assistant message even when codex exits non-zero', () => {
+    const proc = queueProcess();
+    const runner = new CodexRunner();
+    const cb = callbacks();
+
+    runner.run('test', '/tmp', cb);
+    proc.stdout.write('{"type":"item.completed","item":{"type":"agent_message","text":"partial summary"}}\n');
+    proc.emit('close', 1, null);
+
+    expect(cb.onAssistantMessage).toHaveBeenCalledTimes(1);
+    expect(cb.onAssistantMessage).toHaveBeenCalledWith('partial summary');
+    expect(cb.onError).toHaveBeenCalledTimes(1);
+    expect(cb.onDone).not.toHaveBeenCalled();
+  });
+
+  it('emits final assistant message when run is cancelled', () => {
+    const proc = queueProcess();
+    const runner = new CodexRunner();
+    const cb = callbacks();
+
+    runner.run('test', '/tmp', cb);
+    proc.stdout.write('{"type":"item.completed","item":{"type":"agent_message","text":"cancel summary"}}\n');
+    runner.cancel();
+
+    expect(cb.onAssistantMessage).toHaveBeenCalledTimes(1);
+    expect(cb.onAssistantMessage).toHaveBeenCalledWith('cancel summary');
+    expect(cb.onDone).not.toHaveBeenCalled();
     expect(cb.onError).not.toHaveBeenCalled();
   });
 

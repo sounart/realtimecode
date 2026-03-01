@@ -2,10 +2,69 @@ import SwiftUI
 import Foundation
 import AppKit
 
+enum FeedbackMode: String, CaseIterable, Identifiable {
+    case off
+    case voice
+    case silent
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .off:
+            return "Off"
+        case .voice:
+            return "Voice"
+        case .silent:
+            return "Silent"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .off:
+            return "speaker.slash"
+        case .voice:
+            return "speaker.wave.2.fill"
+        case .silent:
+            return "text.bubble"
+        }
+    }
+}
+
+private final class SpeechFeedbackService: NSObject, NSSpeechSynthesizerDelegate {
+    private let synthesizer = NSSpeechSynthesizer()
+    var onFinish: (@MainActor () -> Void)?
+    var isSpeaking: Bool { synthesizer.isSpeaking }
+
+    override init() {
+        super.init()
+        synthesizer.delegate = self
+    }
+
+    func speak(_ text: String) {
+        guard !text.isEmpty else { return }
+        synthesizer.stopSpeaking()
+        _ = synthesizer.startSpeaking(text)
+    }
+
+    func stop() {
+        synthesizer.stopSpeaking()
+    }
+
+    func speechSynthesizer(_ sender: NSSpeechSynthesizer, didFinishSpeaking finishedSpeaking: Bool) {
+        guard finishedSpeaking else { return }
+        Task { @MainActor [weak self] in
+            self?.onFinish?()
+        }
+    }
+}
+
 /// Observable app state shared across the menu bar UI.
 @MainActor
 final class AppState: ObservableObject {
     private static let workdirKey = "RealtimeCodeMenuBar.selectedWorkdir"
+    private static let feedbackModeKey = "RealtimeCodeMenuBar.feedbackMode"
 
     @Published var isRecording = false
     @Published var isConnected = false
@@ -22,10 +81,18 @@ final class AppState: ObservableObject {
     @Published var selectedWorkdir: String
     @Published var hotkeyConfig: HotkeyConfig
     @Published var hotkeyEnabled = true
+    @Published var feedbackMode: FeedbackMode
+    @Published var latestAssistantFeedback = ""
+    @Published var lastChangedFilePath = ""
+    @Published var lastRunFileChangeCount = 0
 
     let micService = MicCaptureService()
     let hotkeyManager = HotkeyManager()
     let orchestratorClient = OrchestratorClient()
+    private let speechFeedback = SpeechFeedbackService()
+    private var resumeCaptureAfterFeedback = false
+    private var currentRunFileChangeCount = 0
+    private var hasActiveCodexRun = false
 
     private var settingsWindow: NSWindow?
 
@@ -40,9 +107,16 @@ final class AppState: ObservableObject {
             self.selectedWorkdir = defaultWorkdir
         }
         self.hotkeyConfig = hotkeyManager.config
+        if let storedMode = UserDefaults.standard.string(forKey: Self.feedbackModeKey),
+           let parsedMode = FeedbackMode(rawValue: storedMode) {
+            self.feedbackMode = parsedMode
+        } else {
+            self.feedbackMode = .off
+        }
         setupMicService()
         setupHotkeyManager()
         setupOrchestratorClient()
+        setupSpeechFeedback()
         refreshCodexUpdateStatus()
     }
 
@@ -74,12 +148,15 @@ final class AppState: ObservableObject {
             case .status(let state):
                 switch state {
                 case "listening":
+                    self.finalizeCodexRunTracking()
                     self.statusText = "Listening..."
                     self.isCodexWorking = false
                 case "executing":
+                    self.beginCodexRunTrackingIfNeeded()
                     self.statusText = "Executing..."
                     self.isCodexWorking = true
                 case "idle":
+                    self.finalizeCodexRunTracking()
                     if self.isRecording {
                         self.micService.stopCapture()
                         self.isRecording = false
@@ -98,11 +175,24 @@ final class AppState: ObservableObject {
                     self.currentTranscript = text
                 }
 
-            case .codex(let type, _):
+            case .codex(let type, let data):
                 switch type {
-                case "tool_call", "file_change":
+                case "tool_call":
                     self.isCodexWorking = true
+                case "file_change":
+                    self.isCodexWorking = true
+                    self.beginCodexRunTrackingIfNeeded()
+                    self.currentRunFileChangeCount += 1
+                    self.lastRunFileChangeCount = self.currentRunFileChangeCount
+                    if let path = data["path"] as? String, !path.isEmpty {
+                        self.lastChangedFilePath = path
+                    }
+                case "assistant_message":
+                    if let text = data["text"] as? String {
+                        self.handleAssistantFeedback(text)
+                    }
                 case "done":
+                    self.finalizeCodexRunTracking()
                     self.isCodexWorking = false
                     if self.statusText == "Executing..." {
                         self.statusText = "Listening..."
@@ -112,6 +202,7 @@ final class AppState: ObservableObject {
                 }
 
             case .error(let message):
+                self.finalizeCodexRunTracking()
                 if self.isRecording && self.isStartupConfigurationError(message) {
                     self.micService.stopCapture()
                     self.isRecording = false
@@ -125,6 +216,7 @@ final class AppState: ObservableObject {
 
         orchestratorClient.onDisconnect = { [weak self] in
             guard let self = self else { return }
+            self.finalizeCodexRunTracking()
             self.isConnected = false
             self.isCodexWorking = false
             self.statusText = "Disconnected"
@@ -134,6 +226,12 @@ final class AppState: ObservableObject {
                 self.micService.stopCapture()
                 self.reconnect()
             }
+        }
+    }
+
+    private func setupSpeechFeedback() {
+        speechFeedback.onFinish = { [weak self] in
+            self?.resumeMicCaptureAfterFeedbackIfNeeded()
         }
     }
 
@@ -160,6 +258,9 @@ final class AppState: ObservableObject {
     }
 
     func stopRecording() {
+        speechFeedback.stop()
+        resumeCaptureAfterFeedback = false
+        finalizeCodexRunTracking()
         micService.stopCapture()
         isRecording = false
         isCodexWorking = false
@@ -242,6 +343,19 @@ final class AppState: ObservableObject {
         hotkeyConfig = hotkeyManager.config
     }
 
+    func setFeedbackMode(_ mode: FeedbackMode) {
+        feedbackMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: Self.feedbackModeKey)
+        if mode != .voice {
+            speechFeedback.stop()
+            resumeMicCaptureAfterFeedbackIfNeeded(force: true)
+        }
+    }
+
+    func clearAssistantFeedback() {
+        latestAssistantFeedback = ""
+    }
+
     func toggleHotkeyListening() {
         if hotkeyEnabled {
             hotkeyManager.stopListening()
@@ -275,6 +389,8 @@ final class AppState: ObservableObject {
 
     func quit() {
         if isRecording { stopRecording() }
+        speechFeedback.stop()
+        resumeCaptureAfterFeedback = false
         orchestratorClient.disconnect()
         hotkeyManager.stopListening()
         NSApplication.shared.terminate(nil)
@@ -350,6 +466,90 @@ final class AppState: ObservableObject {
 
     var codexUpdateButtonTitle: String {
         codexInstalledVersion == nil ? "Install Codex" : "Update Codex"
+    }
+
+    private func handleAssistantFeedback(_ text: String) {
+        let normalized = normalizedAssistantFeedback(text)
+        guard !normalized.isEmpty else { return }
+        latestAssistantFeedback = normalized
+
+        guard feedbackMode == .voice, isRecording else { return }
+        speakAssistantFeedback(normalized)
+    }
+
+    private func speakAssistantFeedback(_ text: String) {
+        // Preserve "resume mic" intent across multiple assistant messages in one speaking window.
+        resumeCaptureAfterFeedback = true
+        if micService.isCapturing {
+            micService.stopCapture()
+        }
+
+        let speechText = speechReadyText(from: text)
+        speechFeedback.speak(speechText)
+    }
+
+    private func normalizedAssistantFeedback(_ text: String) -> String {
+        text.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func speechReadyText(from text: String) -> String {
+        let stripped = text
+            .replacingOccurrences(of: "`", with: "")
+            .replacingOccurrences(of: "\\[(.*?)\\]\\((.*?)\\)", with: "$1", options: .regularExpression)
+        let compact = normalizedAssistantFeedback(stripped)
+        if compact.count <= 280 { return compact }
+        return String(compact.prefix(280)) + "..."
+    }
+
+    private func resumeMicCaptureAfterFeedbackIfNeeded(force: Bool = false) {
+        let shouldResume = force || resumeCaptureAfterFeedback
+        resumeCaptureAfterFeedback = false
+        guard shouldResume else { return }
+        guard !speechFeedback.isSpeaking else { return }
+        guard isRecording, isConnected, !micService.isCapturing else { return }
+
+        do {
+            try micService.startCapture()
+            if statusText != "Executing..." {
+                statusText = "Listening..."
+            }
+        } catch {
+            statusText = "Mic error: \(error.localizedDescription)"
+        }
+    }
+
+    private func beginCodexRunTrackingIfNeeded() {
+        guard !hasActiveCodexRun else { return }
+        hasActiveCodexRun = true
+        currentRunFileChangeCount = 0
+        lastChangedFilePath = ""
+    }
+
+    private func finalizeCodexRunTracking() {
+        if hasActiveCodexRun {
+            lastRunFileChangeCount = currentRunFileChangeCount
+        }
+        hasActiveCodexRun = false
+        currentRunFileChangeCount = 0
+    }
+
+    private var resolvedLastChangedFilePath: String? {
+        guard !lastChangedFilePath.isEmpty else { return nil }
+        if lastChangedFilePath.hasPrefix("/") { return lastChangedFilePath }
+        return URL(fileURLWithPath: selectedWorkdir)
+            .appendingPathComponent(lastChangedFilePath)
+            .path
+    }
+
+    var canRevealLastChangedFile: Bool {
+        guard let path = resolvedLastChangedFilePath else { return false }
+        return FileManager.default.fileExists(atPath: path)
+    }
+
+    func revealLastChangedFile() {
+        guard let path = resolvedLastChangedFilePath else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
     }
 }
 
@@ -629,119 +829,157 @@ struct MenuContent: View {
     @ObservedObject var appState: AppState
 
     var body: some View {
-        HStack(spacing: 8) {
-            statusIndicator
+        VStack(alignment: .leading, spacing: 10) {
+            headerCard
 
-            VStack(alignment: .leading, spacing: 1) {
-                Text(statusTitle)
-                    .font(.headline)
+            if !appState.currentTranscript.isEmpty {
+                infoRow(
+                    title: "Transcript",
+                    systemImage: "waveform",
+                    text: appState.currentTranscript,
+                    lineLimit: 3
+                )
+            }
 
-                if let subtitle = statusSubtitle {
-                    Text(subtitle)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+            if appState.feedbackMode == .silent && !appState.latestAssistantFeedback.isEmpty {
+                infoRow(
+                    title: "Assistant",
+                    systemImage: "text.bubble",
+                    text: appState.latestAssistantFeedback,
+                    lineLimit: 4
+                )
+            }
+
+            if !appState.lastChangedFilePath.isEmpty || appState.lastRunFileChangeCount > 0 {
+                infoRow(
+                    title: "Changes",
+                    systemImage: "doc.badge.gearshape",
+                    text: fileChangeSummaryText,
+                    lineLimit: 2
+                )
+
+                if appState.canRevealLastChangedFile {
+                    Button {
+                        appState.revealLastChangedFile()
+                    } label: {
+                        Label("Reveal Last Changed File", systemImage: "arrow.up.forward.app")
+                    }
                 }
             }
 
-            Spacer(minLength: 8)
-
-            Text(connectionStatusTitle)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-        }
-
-        if !appState.currentTranscript.isEmpty {
-            infoRow(
-                title: "Transcript",
-                systemImage: "waveform",
-                text: appState.currentTranscript,
-                lineLimit: 3
-            )
-        }
-
-        codexActivityRow
-
-        if appState.shouldShowCodexUpdateNotification {
-            codexUpdateNotificationRow
-        }
-
-        Divider()
-
-        Button {
-            if appState.isRecording {
-                appState.stopRecording()
-            } else {
-                appState.startRecording()
+            if appState.shouldShowCodexUpdateNotification {
+                codexUpdateNotificationRow
             }
-        } label: {
-            Label(
-                appState.isRecording ? "Stop Recording" : "Start Recording",
-                systemImage: appState.isRecording ? "stop.circle.fill" : "mic.circle.fill"
-            )
+
+            Divider()
+
+            sectionHeader("Session")
+
+            Button {
+                if appState.isRecording {
+                    appState.stopRecording()
+                } else {
+                    appState.startRecording()
+                }
+            } label: {
+                Label(
+                    appState.isRecording ? "Stop Recording" : "Start Recording",
+                    systemImage: appState.isRecording ? "stop.circle.fill" : "mic.circle.fill"
+                )
+            }
+            .keyboardShortcut("r")
+            .disabled(isConnecting)
+
+            Divider()
+
+            sectionHeader("Workspace")
+
+            Label {
+                Text(displayWorkdir)
+                    .font(.caption2)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            } icon: {
+                Image(systemName: "folder")
+                    .foregroundStyle(.secondary)
+            }
+            .help(appState.selectedWorkdir)
+
+            Button {
+                appState.chooseWorkdir()
+            } label: {
+                Label("Choose Directory...", systemImage: "folder.badge.gearshape")
+            }
+
+            Button {
+                revealWorkdirInFinder()
+            } label: {
+                Label("Reveal in Finder", systemImage: "arrow.up.forward.app")
+            }
+            .disabled(!canRevealWorkdir)
+
+            Divider()
+
+            sectionHeader("Preferences")
+
+            Label {
+                Text(appState.hotkeyConfig.displayName)
+                    .font(.caption2)
+            } icon: {
+                Image(systemName: "keyboard")
+                    .foregroundStyle(.secondary)
+            }
+
+            Button {
+                appState.openSettings()
+            } label: {
+                Label("Hotkey Settings...", systemImage: "gearshape")
+            }
+
+            Menu {
+                ForEach(FeedbackMode.allCases) { mode in
+                    Button {
+                        appState.setFeedbackMode(mode)
+                    } label: {
+                        if mode == appState.feedbackMode {
+                            Label(mode.displayName, systemImage: "checkmark")
+                        } else {
+                            Text(mode.displayName)
+                        }
+                    }
+                }
+            } label: {
+                Label("Feedback: \(appState.feedbackMode.displayName)", systemImage: appState.feedbackMode.systemImage)
+            }
+
+            if appState.feedbackMode == .silent && !appState.latestAssistantFeedback.isEmpty {
+                Button {
+                    appState.clearAssistantFeedback()
+                } label: {
+                    Label("Clear Assistant Text", systemImage: "xmark.circle")
+                }
+            }
+
+            Button {
+                appState.toggleHotkeyListening()
+            } label: {
+                Label(
+                    appState.hotkeyEnabled ? "Disable Hotkey" : "Enable Hotkey",
+                    systemImage: appState.hotkeyEnabled ? "bolt.slash.fill" : "bolt.fill"
+                )
+            }
+
+            Divider()
+
+            Button(role: .destructive) {
+                appState.quit()
+            } label: {
+                Label("Quit RealtimeCode", systemImage: "power")
+            }
+            .keyboardShortcut("q")
         }
-        .keyboardShortcut("r")
-        .disabled(isConnecting)
-
-        Divider()
-
-        Label {
-            Text(displayWorkdir)
-                .font(.caption2)
-                .lineLimit(1)
-                .truncationMode(.middle)
-        } icon: {
-            Image(systemName: "folder")
-                .foregroundStyle(.secondary)
-        }
-        .help(appState.selectedWorkdir)
-
-        Button {
-            appState.chooseWorkdir()
-        } label: {
-            Label("Choose Directory...", systemImage: "folder.badge.gearshape")
-        }
-
-        Button {
-            revealWorkdirInFinder()
-        } label: {
-            Label("Reveal in Finder", systemImage: "arrow.up.forward.app")
-        }
-        .disabled(!canRevealWorkdir)
-
-        Divider()
-
-        Label {
-            Text(appState.hotkeyConfig.displayName)
-                .font(.caption2)
-        } icon: {
-            Image(systemName: "keyboard")
-                .foregroundStyle(.secondary)
-        }
-
-        Button {
-            appState.openSettings()
-        } label: {
-            Label("Hotkey Settings...", systemImage: "gearshape")
-        }
-
-        Button {
-            appState.toggleHotkeyListening()
-        } label: {
-            Label(
-                appState.hotkeyEnabled ? "Disable Hotkey" : "Enable Hotkey",
-                systemImage: appState.hotkeyEnabled ? "bolt.slash.fill" : "bolt.fill"
-            )
-        }
-
-        Divider()
-
-        Button(role: .destructive) {
-            appState.quit()
-        } label: {
-            Label("Quit RealtimeCode", systemImage: "power")
-        }
-        .keyboardShortcut("q")
+        .frame(width: 340)
+        .padding(.vertical, 4)
     }
 
     private enum StatusSummary {
@@ -835,13 +1073,64 @@ struct MenuContent: View {
         appState.isCodexWorking ? .orange : .secondary
     }
 
-    private var codexActivityRow: some View {
+    private var headerCard: some View {
         HStack(spacing: 8) {
             codexActivityIndicator
-            Text(appState.isCodexWorking ? "Codex is working" : "Codex is idle")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(statusTitle)
+                    .font(.headline)
+                if let subtitle = statusSubtitle {
+                    Text(subtitle)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else {
+                    Text(appState.isCodexWorking ? "Codex active" : "Codex idle")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 8)
+            statusBadge(connectionStatusTitle, color: appState.isConnected ? .green : .secondary)
         }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.primary.opacity(0.07))
+        )
+    }
+
+    private func sectionHeader(_ title: String) -> some View {
+        Text(title.uppercased())
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .tracking(0.6)
+    }
+
+    private func statusBadge(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.caption2.weight(.semibold))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(color.opacity(0.15))
+            )
+            .foregroundStyle(color)
+    }
+
+    private var fileChangeSummaryText: String {
+        let count = appState.lastRunFileChangeCount
+        if appState.lastChangedFilePath.isEmpty {
+            if count == 1 { return "1 file changed in the latest run" }
+            return "\(count) files changed in the latest run"
+        }
+
+        if count <= 1 {
+            return appState.lastChangedFilePath
+        }
+        return "\(appState.lastChangedFilePath) • \(count) files changed"
     }
 
     private var codexUpdateNotificationRow: some View {
@@ -882,6 +1171,11 @@ struct MenuContent: View {
                 .disabled(appState.isCheckingCodexUpdate || appState.isUpdatingCodex)
             }
         }
+        .padding(8)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.primary.opacity(0.06))
+        )
     }
 
     private var codexUpdateIconName: String {
@@ -919,39 +1213,6 @@ struct MenuContent: View {
         .accessibilityValue(appState.isCodexWorking ? "Working" : "Idle")
     }
 
-    private var statusColor: Color {
-        switch summary {
-        case .error:
-            return .red
-        case .connecting:
-            return .blue
-        case .listening:
-            return .red
-        case .executing:
-            return .orange
-        case .connected:
-            return .green
-        case .disconnected:
-            return .orange
-        case .ready:
-            return .secondary
-        }
-    }
-
-    @ViewBuilder
-    private var statusIndicator: some View {
-        switch summary {
-        case .connecting, .executing:
-            ProgressView()
-                .controlSize(.small)
-                .frame(width: 10, height: 10)
-        default:
-            Circle()
-                .fill(statusColor)
-                .frame(width: 8, height: 8)
-        }
-    }
-
     private var canRevealWorkdir: Bool {
         FileManager.default.fileExists(atPath: appState.selectedWorkdir)
     }
@@ -977,12 +1238,18 @@ struct MenuContent: View {
     private func infoRow(title: String, systemImage: String, text: String, lineLimit: Int) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Label(title, systemImage: systemImage)
-                .font(.caption2)
+                .font(.caption2.weight(.semibold))
                 .foregroundStyle(.secondary)
             Text(text)
                 .font(.caption)
                 .lineLimit(lineLimit)
                 .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
         }
+        .padding(8)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.primary.opacity(0.06))
+        )
     }
 }

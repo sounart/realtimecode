@@ -46,6 +46,7 @@ describe('Transcriber', () => {
       {
         onPartialTranscript: vi.fn(),
         onFinalTranscript: vi.fn(),
+        onSpeechStarted: vi.fn(),
         onError: vi.fn(),
         onReady: vi.fn(),
       },
@@ -79,6 +80,7 @@ describe('Transcriber', () => {
       {
         onPartialTranscript: vi.fn(),
         onFinalTranscript: vi.fn(),
+        onSpeechStarted: vi.fn(),
         onError: vi.fn(),
         onReady: vi.fn(),
       },
@@ -122,6 +124,7 @@ describe('Transcriber', () => {
       {
         onPartialTranscript: vi.fn(),
         onFinalTranscript: vi.fn(),
+        onSpeechStarted: vi.fn(),
         onError: vi.fn(),
         onReady: vi.fn(),
       },
@@ -163,6 +166,7 @@ describe('Transcriber', () => {
       {
         onPartialTranscript: vi.fn(),
         onFinalTranscript: vi.fn(),
+        onSpeechStarted: vi.fn(),
         onError: vi.fn(),
         onReady: vi.fn(),
       },
@@ -186,6 +190,7 @@ describe('Transcriber', () => {
       {
         onPartialTranscript: vi.fn(),
         onFinalTranscript: vi.fn(),
+        onSpeechStarted: vi.fn(),
         onError: vi.fn(),
         onReady: vi.fn(),
       },
@@ -209,6 +214,7 @@ describe('Transcriber', () => {
       {
         onPartialTranscript: vi.fn(),
         onFinalTranscript: vi.fn(),
+        onSpeechStarted: vi.fn(),
         onError: vi.fn(),
         onReady: vi.fn(),
       },
@@ -233,6 +239,7 @@ describe('Transcriber', () => {
       {
         onPartialTranscript: vi.fn(),
         onFinalTranscript: vi.fn(),
+        onSpeechStarted: vi.fn(),
         onError: vi.fn(),
         onReady: vi.fn(),
       },
@@ -270,6 +277,7 @@ describe('Transcriber', () => {
       {
         onPartialTranscript: vi.fn(),
         onFinalTranscript: vi.fn(),
+        onSpeechStarted: vi.fn(),
         onError: vi.fn(),
         onReady: vi.fn(),
       },
@@ -294,6 +302,7 @@ describe('Transcriber', () => {
       {
         onPartialTranscript: vi.fn(),
         onFinalTranscript: vi.fn(),
+        onSpeechStarted: vi.fn(),
         onError,
         onReady,
       },
@@ -326,6 +335,35 @@ describe('Transcriber', () => {
     expect(onError).not.toHaveBeenCalled();
   });
 
+  it('surfaces input_audio_buffer.speech_started events via callback', () => {
+    const sockets: FakeSocket[] = [];
+    const socketFactory = () => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      return socket as unknown as WebSocket;
+    };
+
+    const onSpeechStarted = vi.fn();
+    const transcriber = new Transcriber(
+      { apiKey: 'test', socketFactory },
+      {
+        onPartialTranscript: vi.fn(),
+        onFinalTranscript: vi.fn(),
+        onSpeechStarted,
+        onError: vi.fn(),
+        onReady: vi.fn(),
+      },
+    );
+
+    transcriber.connect();
+    const socket = sockets[0];
+    socket.readyState = FakeSocket.OPEN;
+    socket.emit('open');
+    socket.emit('message', JSON.stringify({ type: 'input_audio_buffer.speech_started' }));
+
+    expect(onSpeechStarted).toHaveBeenCalledTimes(1);
+  });
+
   it('forwards server errors instead of sending legacy beta updates', () => {
     const sockets: FakeSocket[] = [];
     const socketFactory = () => {
@@ -340,6 +378,7 @@ describe('Transcriber', () => {
       {
         onPartialTranscript: vi.fn(),
         onFinalTranscript: vi.fn(),
+        onSpeechStarted: vi.fn(),
         onError,
         onReady: vi.fn(),
       },
@@ -374,6 +413,7 @@ describe('Transcriber', () => {
       {
         onPartialTranscript: vi.fn(),
         onFinalTranscript,
+        onSpeechStarted: vi.fn(),
         onError: vi.fn(),
         onReady: vi.fn(),
       },
@@ -420,6 +460,7 @@ describe('Transcriber', () => {
       {
         onPartialTranscript: vi.fn(),
         onFinalTranscript: vi.fn(),
+        onSpeechStarted: vi.fn(),
         onError,
         onReady: vi.fn(),
       },

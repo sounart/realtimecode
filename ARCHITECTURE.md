@@ -47,7 +47,7 @@ Three source files under `services/orchestrator/src/`:
 | Method | Params | Description |
 |--------|--------|-------------|
 | `transcript` | `{ text, final }` | Partial/final speech |
-| `codex` | `{ type, data }` | tool_call, file_change, output, done |
+| `codex` | `{ type, data }` | tool_call, file_change, assistant_message, queued, done |
 | `status` | `{ state }` | idle/listening/executing |
 | `error` | `{ message }` | Any problem |
 

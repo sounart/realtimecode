@@ -17,6 +17,7 @@ import {
 export interface TranscriberCallbacks {
   onPartialTranscript: (text: string) => void;
   onFinalTranscript: (text: string) => void;
+  onSpeechStarted: () => void;
   onError: (error: Error) => void;
   onReady: () => void;
 }
@@ -342,6 +343,8 @@ export class Transcriber {
         this.handleErrorEvent(event as Record<string, unknown>);
         break;
       case 'input_audio_buffer.speech_started':
+        this.cb.onSpeechStarted();
+        break;
       case 'input_audio_buffer.speech_stopped':
         break; // VAD events — no action needed
       default:

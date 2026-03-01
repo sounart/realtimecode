@@ -36,6 +36,7 @@ let authToken: string | null = null;
 const pendingInstructions: string[] = [];
 let transcriptParts: string[] = [];
 let transcriptCommitTimer: NodeJS.Timeout | null = null;
+let partialTranscript = '';
 let lastQueuedInstruction = '';
 let lastQueuedAtMs = 0;
 
@@ -102,9 +103,38 @@ function clearTranscriptParts(): void {
   }
 }
 
+function clearPartialTranscript(): void {
+  partialTranscript = '';
+}
+
 function clearInstructionQueue(): void {
   pendingInstructions.length = 0;
   clearTranscriptParts();
+  clearPartialTranscript();
+  lastQueuedInstruction = '';
+  lastQueuedAtMs = 0;
+}
+
+function appendPartialTranscriptDelta(delta: string): string {
+  partialTranscript += delta;
+  return normalizeText(partialTranscript);
+}
+
+function interruptExecutionForLiveSpeech(trigger: 'speech_started' | 'partial_transcript'): void {
+  if (state !== 'executing' || !codex.isRunning) return;
+
+  const droppedQueueDepth = pendingInstructions.length;
+  logger.info('interrupting active codex run due to new speech', {
+    trigger,
+    droppedQueueDepth,
+  });
+
+  codex.cancel();
+  clearInstructionQueue();
+  if (droppedQueueDepth > 0) {
+    notify('codex', { type: 'queued', data: { queueDepth: 0 } });
+  }
+  setState('listening');
 }
 
 function shouldIgnoreInstructionText(normalized: string): { ignore: boolean; reason?: string; words: number; alnumChars: number } {
@@ -210,8 +240,6 @@ function startListening(dir: string): string | null {
 
   workdir = dir;
   clearInstructionQueue();
-  lastQueuedInstruction = '';
-  lastQueuedAtMs = 0;
 
   if (transcriber) {
     transcriber.disconnect();
@@ -220,11 +248,22 @@ function startListening(dir: string): string | null {
 
   transcriber = new Transcriber({ apiKey }, {
     onPartialTranscript(text) {
-      notify('transcript', { text, final: false });
+      const cumulative = appendPartialTranscriptDelta(text);
+      if (cumulative) {
+        notify('transcript', { text: cumulative, final: false });
+      }
+      if (/[a-z0-9]/i.test(text)) {
+        interruptExecutionForLiveSpeech('partial_transcript');
+      }
     },
     onFinalTranscript(text) {
+      clearPartialTranscript();
       notify('transcript', { text, final: true });
       bufferFinalTranscript(text);
+    },
+    onSpeechStarted() {
+      clearPartialTranscript();
+      interruptExecutionForLiveSpeech('speech_started');
     },
     onError(err) {
       logger.error('transcriber error', { message: err.message });
@@ -271,6 +310,9 @@ function executeInstruction(text: string): void {
     },
     onFileChange(filePath, changeType) {
       notify('codex', { type: 'file_change', data: { path: filePath, changeType } });
+    },
+    onAssistantMessage(text) {
+      notify('codex', { type: 'assistant_message', data: { text } });
     },
     onOutput(output) {
       process.stdout.write(output);

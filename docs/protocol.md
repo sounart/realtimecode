@@ -10,7 +10,7 @@ Current transport is newline-delimited JSON-RPC 2.0 over a Unix domain socket.
 
 ## Event Types
 - `transcript`
-- `codex` (`tool_call`, `file_change`, `done`)
+- `codex` (`tool_call`, `file_change`, `assistant_message`, `queued`, `done`)
 - `status`
 - `error`
 

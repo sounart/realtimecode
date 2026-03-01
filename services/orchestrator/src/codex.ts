@@ -10,6 +10,7 @@ import {
 export interface CodexCallbacks {
   onToolCall: (tool: string, args: Record<string, unknown>) => void;
   onFileChange: (path: string, changeType: string) => void;
+  onAssistantMessage: (text: string) => void;
   onOutput: (text: string) => void;
   onDone: () => void;
   onError: (error: Error) => void;
@@ -20,6 +21,7 @@ interface SpawnContext {
   timeout: NodeJS.Timeout;
   forceKillTimer: NodeJS.Timeout | null;
   cancelled: boolean;
+  latestAssistantMessage: string | null;
   cb: CodexCallbacks;
   runId: number;
   startedAtMs: number;
@@ -29,6 +31,10 @@ function parseEnabled(raw: string | undefined): boolean {
   if (!raw) return false;
   const normalized = raw.trim().toLowerCase();
   return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
 }
 
 export class CodexRunner {
@@ -41,6 +47,9 @@ export class CodexRunner {
     if (!active) return;
 
     active.cancelled = true;
+    if (active.latestAssistantMessage) {
+      active.cb.onAssistantMessage(active.latestAssistantMessage);
+    }
     clearTimeout(active.timeout);
     if (active.forceKillTimer) {
       clearTimeout(active.forceKillTimer);
@@ -156,12 +165,16 @@ export class CodexRunner {
 
         const message = `Codex execution timed out after ${timeoutMs}ms`;
         logger.error('codex run timeout', { runId: ctx.runId, pid: proc.pid ?? null, timeoutMs });
+        if (ctx.latestAssistantMessage) {
+          ctx.cb.onAssistantMessage(ctx.latestAssistantMessage);
+        }
         ctx.cb.onError(new Error(message));
         proc.kill('SIGTERM');
         this.scheduleForceKill(ctx, 'timeout');
       }, timeoutMs),
       forceKillTimer: null,
       cancelled: false,
+      latestAssistantMessage: null,
       cb: params.cb,
       runId: params.runId,
       startedAtMs: Date.now(),
@@ -187,7 +200,7 @@ export class CodexRunner {
       while (nl >= 0) {
         const line = buffer.slice(0, nl).replace(/\r$/, '');
         buffer = buffer.slice(nl + 1);
-        if (line) this.handleLine(line, ctx.cb);
+        if (line) this.handleLine(line, ctx);
         nl = buffer.indexOf('\n');
       }
     });
@@ -236,7 +249,7 @@ export class CodexRunner {
       if (!wasActive || ctx.cancelled) return;
 
       const trailing = buffer.replace(/\r$/, '').trim();
-      if (trailing) this.handleLine(trailing, ctx.cb);
+      if (trailing) this.handleLine(trailing, ctx);
 
       const elapsedMs = Date.now() - ctx.startedAtMs;
       logger.info('codex run exited', {
@@ -247,6 +260,15 @@ export class CodexRunner {
         elapsedMs,
       });
 
+      if (ctx.latestAssistantMessage) {
+        ctx.cb.onAssistantMessage(ctx.latestAssistantMessage);
+      } else {
+        logger.info('codex run exited without assistant summary', {
+          runId: ctx.runId,
+          code,
+          signal,
+        });
+      }
       if (signal !== null || code !== 0) {
         const reason = signal !== null
           ? `Codex exited due to signal ${signal}`
@@ -274,25 +296,101 @@ export class CodexRunner {
     }, this.killGraceMs);
   }
 
-  private handleLine(line: string, cb: CodexCallbacks): void {
+  private handleLine(line: string, ctx: SpawnContext): void {
     try {
       const parsed = JSON.parse(line) as Record<string, unknown>;
+      this.captureAssistantMessage(parsed, ctx);
 
       if (parsed['type'] === 'tool_call') {
-        cb.onToolCall(
+        ctx.cb.onToolCall(
           String(parsed['tool'] ?? ''),
           (parsed['args'] as Record<string, unknown>) ?? {},
         );
       } else if (parsed['type'] === 'file_change') {
-        cb.onFileChange(
+        ctx.cb.onFileChange(
           String(parsed['path'] ?? ''),
           String(parsed['change'] ?? 'update'),
         );
       } else {
-        cb.onOutput(line + '\n');
+        ctx.cb.onOutput(line + '\n');
       }
     } catch {
-      cb.onOutput(line + '\n');
+      ctx.cb.onOutput(line + '\n');
     }
+  }
+
+  private captureAssistantMessage(parsed: Record<string, unknown>, ctx: SpawnContext): void {
+    const direct = this.extractAssistantMessageText(parsed);
+    if (direct) {
+      ctx.latestAssistantMessage = direct;
+      return;
+    }
+
+    const item = parsed['item'];
+    const nested = this.extractAssistantMessageText(item);
+    if (nested) {
+      ctx.latestAssistantMessage = nested;
+    }
+  }
+
+  private extractAssistantMessageText(value: unknown): string | null {
+    if (!isRecord(value)) return null;
+
+    const type = typeof value['type'] === 'string' ? value['type'] : '';
+    const role = typeof value['role'] === 'string' ? value['role'] : '';
+    const looksLikeAssistantMessage = (
+      type === 'agent_message'
+      || type === 'assistant_message'
+      || type === 'message'
+      || role === 'assistant'
+    );
+    if (!looksLikeAssistantMessage) return null;
+
+    const directText = this.normalizeAssistantMessageText(
+      typeof value['text'] === 'string' ? value['text'] : '',
+    );
+    if (directText) return directText;
+
+    const contentText = this.extractTextFromUnknown(value['content']);
+    if (contentText) return contentText;
+
+    const outputText = this.extractTextFromUnknown(value['output']);
+    if (outputText) return outputText;
+
+    const nestedMessage = this.extractAssistantMessageText(value['message']);
+    if (nestedMessage) return nestedMessage;
+
+    return null;
+  }
+
+  private extractTextFromUnknown(value: unknown): string | null {
+    if (typeof value === 'string') {
+      return this.normalizeAssistantMessageText(value);
+    }
+    if (!Array.isArray(value)) return null;
+
+    const collected: string[] = [];
+    for (const part of value) {
+      if (typeof part === 'string') {
+        collected.push(part);
+        continue;
+      }
+      if (!isRecord(part)) continue;
+
+      if (typeof part['text'] === 'string') {
+        collected.push(part['text']);
+      }
+      const nested = this.extractTextFromUnknown(part['content']);
+      if (nested) {
+        collected.push(nested);
+      }
+    }
+
+    return this.normalizeAssistantMessageText(collected.join(' '));
+  }
+
+  private normalizeAssistantMessageText(raw: string): string | null {
+    const normalized = raw.replace(/\s+/g, ' ').trim();
+    return normalized || null;
   }
 }

@@ -31,6 +31,7 @@ final class OrchestratorClient {
     private static let audioNotificationSuffix = Data("\"}}\n".utf8)
     private static let maxIncomingBufferBytes = 1_048_576
     private static let maxAudioChunkBase64Chars = 256_000
+    private static let maxPendingAudioChunks = 64
 
     private let socketPath: String
     private let authTokenPath: String
@@ -49,6 +50,7 @@ final class OrchestratorClient {
     private var authRequestId: Int?
     private var authRetryAttempted = false
     private var pendingOutboundMessages: [[String: Any]] = []
+    private var pendingAudioChunks: [String] = []
 
     /// Called on the main queue when an event is received.
     var onEvent: ((OrchestratorEvent) -> Void)?
@@ -332,6 +334,7 @@ final class OrchestratorClient {
         authRequestId = nil
         authRetryAttempted = false
         pendingOutboundMessages.removeAll(keepingCapacity: false)
+        clearPendingAudioChunks()
         startReading()
         authenticate()
     }
@@ -396,6 +399,7 @@ final class OrchestratorClient {
         authRequestId = nil
         authRetryAttempted = false
         pendingOutboundMessages.removeAll(keepingCapacity: false)
+        clearPendingAudioChunks()
         readBuffer = Data()
         terminateLaunchedBackendIfNeeded()
     }
@@ -420,10 +424,18 @@ final class OrchestratorClient {
             onEvent?(.error(message: "Audio chunk too large; dropped"))
             return
         }
-        guard isConnected, isAuthenticated else { return }
+        guard isConnected else { return }
         queue.async { [weak self] in
-            guard let self = self, self.isConnected, self.isAuthenticated else { return }
-            self.sendAudioNotification(base64Chunk)
+            guard let self = self, self.isConnected else { return }
+            if self.isAuthenticated {
+                self.sendAudioNotification(base64Chunk)
+                return
+            }
+
+            if self.pendingAudioChunks.count >= Self.maxPendingAudioChunks {
+                self.pendingAudioChunks.removeFirst()
+            }
+            self.pendingAudioChunks.append(base64Chunk)
         }
     }
 
@@ -472,6 +484,23 @@ final class OrchestratorClient {
         pendingOutboundMessages.removeAll(keepingCapacity: false)
         for message in queued {
             sendJSON(message)
+        }
+    }
+
+    private func flushPendingAudioChunks() {
+        queue.async { [weak self] in
+            guard let self = self, self.isConnected, self.isAuthenticated, !self.pendingAudioChunks.isEmpty else { return }
+            let queued = self.pendingAudioChunks
+            self.pendingAudioChunks.removeAll(keepingCapacity: false)
+            for chunk in queued {
+                self.sendAudioNotification(chunk)
+            }
+        }
+    }
+
+    private func clearPendingAudioChunks() {
+        queue.async { [weak self] in
+            self?.pendingAudioChunks.removeAll(keepingCapacity: false)
         }
     }
 
@@ -631,6 +660,7 @@ final class OrchestratorClient {
                 if let message = errorMessage {
                     isAuthenticated = false
                     authRequestId = nil
+                    clearPendingAudioChunks()
 
                     if message == "Unauthorized: invalid token" && !authRetryAttempted && refreshAuthTokenFromDisk() {
                         authRetryAttempted = true
@@ -647,6 +677,7 @@ final class OrchestratorClient {
                 authRequestId = nil
                 authRetryAttempted = false
                 flushPendingOutboundMessages()
+                flushPendingAudioChunks()
                 return
             }
 
@@ -690,6 +721,7 @@ final class OrchestratorClient {
         authRequestId = nil
         authRetryAttempted = false
         pendingOutboundMessages.removeAll(keepingCapacity: false)
+        clearPendingAudioChunks()
         readSource?.cancel()
         readSource = nil
         if socketFd >= 0 {
