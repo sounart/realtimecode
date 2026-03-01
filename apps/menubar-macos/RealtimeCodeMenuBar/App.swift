@@ -20,12 +20,14 @@ final class AppState: ObservableObject {
     @Published var isUpdatingCodex = false
     @Published private(set) var hasCheckedCodexUpdate = false
     @Published var selectedWorkdir: String
-    @Published var hotkeyPreset: HotkeyPreset
+    @Published var hotkeyConfig: HotkeyConfig
     @Published var hotkeyEnabled = true
 
     let micService = MicCaptureService()
     let hotkeyManager = HotkeyManager()
     let orchestratorClient = OrchestratorClient()
+
+    private var settingsWindow: NSWindow?
 
     private let defaultWorkdir = ProcessInfo.processInfo.environment["RTC_WORKDIR"]
         ?? FileManager.default.homeDirectoryForCurrentUser.path
@@ -37,7 +39,7 @@ final class AppState: ObservableObject {
         } else {
             self.selectedWorkdir = defaultWorkdir
         }
-        self.hotkeyPreset = hotkeyManager.preset
+        self.hotkeyConfig = hotkeyManager.config
         setupMicService()
         setupHotkeyManager()
         setupOrchestratorClient()
@@ -232,7 +234,12 @@ final class AppState: ObservableObject {
 
     func setHotkeyPreset(_ preset: HotkeyPreset) {
         hotkeyManager.setPreset(preset)
-        hotkeyPreset = preset
+        hotkeyConfig = hotkeyManager.config
+    }
+
+    func setCustomHotkey(_ hotkey: CustomHotkey) {
+        hotkeyManager.setCustomHotkey(hotkey)
+        hotkeyConfig = hotkeyManager.config
     }
 
     func toggleHotkeyListening() {
@@ -242,6 +249,28 @@ final class AppState: ObservableObject {
             hotkeyManager.startListening()
         }
         hotkeyEnabled = hotkeyManager.isListening
+    }
+
+    func openSettings() {
+        if let window = settingsWindow, window.isVisible {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let settingsView = SettingsView(appState: self)
+        let hostingController = NSHostingController(rootView: settingsView)
+        let window = NSWindow(contentViewController: hostingController)
+        window.title = "RealtimeCode Settings"
+        window.styleMask = [.titled, .closable]
+        window.setContentSize(NSSize(width: 380, height: 260))
+        window.center()
+        window.isReleasedWhenClosed = false
+        window.level = .floating
+
+        settingsWindow = window
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     func quit() {
@@ -360,6 +389,240 @@ struct RealtimeCodeMenuBarApp: App {
     }
 }
 
+// MARK: - Settings View
+
+struct SettingsView: View {
+    @ObservedObject var appState: AppState
+    @State private var isRecordingHotkey = false
+    @State private var recordedHotkey: CustomHotkey?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Global Hotkey")
+                .font(.headline)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Presets")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+
+                ForEach(HotkeyPreset.allCases) { preset in
+                    HStack {
+                        Image(systemName: isPresetSelected(preset) ? "circle.inset.filled" : "circle")
+                            .foregroundStyle(isPresetSelected(preset) ? Color.accentColor : Color.secondary)
+                        Text(preset.displayName)
+                        Spacer()
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        appState.setHotkeyPreset(preset)
+                        recordedHotkey = nil
+                    }
+                }
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Custom Shortcut")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+
+                HotkeyRecorderView(
+                    isRecording: $isRecordingHotkey,
+                    currentConfig: appState.hotkeyConfig,
+                    recordedHotkey: $recordedHotkey,
+                    onRecord: { hotkey in
+                        appState.setCustomHotkey(hotkey)
+                    },
+                    onClear: {
+                        appState.setHotkeyPreset(.commandShiftR)
+                    }
+                )
+            }
+
+            Divider()
+
+            Toggle(isOn: Binding(
+                get: { appState.hotkeyEnabled },
+                set: { _ in appState.toggleHotkeyListening() }
+            )) {
+                Text("Enable global hotkey")
+            }
+
+            Spacer()
+        }
+        .padding(20)
+        .frame(width: 380, height: 260)
+    }
+
+    private func isPresetSelected(_ preset: HotkeyPreset) -> Bool {
+        if case .preset(let current) = appState.hotkeyConfig {
+            return current == preset
+        }
+        return false
+    }
+}
+
+/// A press-to-record hotkey field that captures arbitrary key + modifier combos.
+struct HotkeyRecorderView: NSViewRepresentable {
+    @Binding var isRecording: Bool
+    let currentConfig: HotkeyConfig
+    @Binding var recordedHotkey: CustomHotkey?
+    let onRecord: (CustomHotkey) -> Void
+    let onClear: () -> Void
+
+    func makeNSView(context: Context) -> HotkeyRecorderNSView {
+        let view = HotkeyRecorderNSView()
+        view.onHotkeyRecorded = { hotkey in
+            DispatchQueue.main.async {
+                recordedHotkey = hotkey
+                isRecording = false
+                onRecord(hotkey)
+            }
+        }
+        view.onRecordingChanged = { recording in
+            DispatchQueue.main.async {
+                isRecording = recording
+            }
+        }
+        view.onClearPressed = {
+            DispatchQueue.main.async {
+                recordedHotkey = nil
+                isRecording = false
+                onClear()
+            }
+        }
+        view.updateDisplay(config: currentConfig, isRecording: false)
+        return view
+    }
+
+    func updateNSView(_ nsView: HotkeyRecorderNSView, context: Context) {
+        nsView.updateDisplay(config: currentConfig, isRecording: isRecording)
+    }
+}
+
+/// AppKit view that handles key event capture for hotkey recording.
+final class HotkeyRecorderNSView: NSView {
+    var onHotkeyRecorded: ((CustomHotkey) -> Void)?
+    var onRecordingChanged: ((Bool) -> Void)?
+    var onClearPressed: (() -> Void)?
+
+    private var recording = false
+    private let label = NSTextField(labelWithString: "")
+    private let recordButton = NSButton()
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override init(frame: NSRect) {
+        super.init(frame: NSRect(x: 0, y: 0, width: 340, height: 28))
+        setupViews()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setupViews()
+    }
+
+    private func setupViews() {
+        label.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
+        label.textColor = .secondaryLabelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        recordButton.title = "Record"
+        recordButton.bezelStyle = .rounded
+        recordButton.controlSize = .small
+        recordButton.target = self
+        recordButton.action = #selector(toggleRecording)
+        recordButton.translatesAutoresizingMaskIntoConstraints = false
+
+        let clearButton = NSButton()
+        clearButton.title = "Clear"
+        clearButton.bezelStyle = .rounded
+        clearButton.controlSize = .small
+        clearButton.target = self
+        clearButton.action = #selector(clearHotkey)
+        clearButton.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(label)
+        addSubview(recordButton)
+        addSubview(clearButton)
+
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            clearButton.trailingAnchor.constraint(equalTo: trailingAnchor),
+            clearButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            clearButton.widthAnchor.constraint(equalToConstant: 50),
+
+            recordButton.trailingAnchor.constraint(equalTo: clearButton.leadingAnchor, constant: -4),
+            recordButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            recordButton.widthAnchor.constraint(equalToConstant: 60),
+
+            label.trailingAnchor.constraint(lessThanOrEqualTo: recordButton.leadingAnchor, constant: -8),
+
+            heightAnchor.constraint(equalToConstant: 28),
+        ])
+    }
+
+    func updateDisplay(config: HotkeyConfig, isRecording: Bool) {
+        if isRecording {
+            label.stringValue = "Press a key combo..."
+            label.textColor = .systemOrange
+            recordButton.title = "Cancel"
+        } else {
+            if case .custom = config {
+                label.stringValue = config.displayName
+                label.textColor = .labelColor
+            } else {
+                label.stringValue = "Click Record to set custom hotkey"
+                label.textColor = .secondaryLabelColor
+            }
+            recordButton.title = "Record"
+        }
+    }
+
+    @objc private func toggleRecording() {
+        recording.toggle()
+        onRecordingChanged?(recording)
+        if recording {
+            window?.makeFirstResponder(self)
+        }
+    }
+
+    @objc private func clearHotkey() {
+        recording = false
+        onRecordingChanged?(false)
+        onClearPressed?()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        guard recording else {
+            super.keyDown(with: event)
+            return
+        }
+
+        let modifiers = event.modifierFlags.intersection([.command, .shift, .option, .control])
+
+        // Require at least one modifier
+        guard !modifiers.isEmpty else { return }
+
+        // Ignore bare modifier presses (key codes 54-59, 63 are modifier keys)
+        let modifierKeyCodes: Set<UInt16> = [54, 55, 56, 57, 58, 59, 63]
+        guard !modifierKeyCodes.contains(event.keyCode) else { return }
+
+        let hotkey = CustomHotkey(keyCode: CGKeyCode(event.keyCode), modifiers: modifiers)
+        recording = false
+        onHotkeyRecorded?(hotkey)
+    }
+
+    override func flagsChanged(with event: NSEvent) {
+        // Don't consume modifier-only events
+        super.flagsChanged(with: event)
+    }
+}
+
 // MARK: - Menu Content
 
 struct MenuContent: View {
@@ -448,20 +711,18 @@ struct MenuContent: View {
 
         Divider()
 
-        Menu {
-            ForEach(HotkeyPreset.allCases) { preset in
-                Button {
-                    appState.setHotkeyPreset(preset)
-                } label: {
-                    if preset == appState.hotkeyPreset {
-                        Label(preset.displayName, systemImage: "checkmark")
-                    } else {
-                        Text(preset.displayName)
-                    }
-                }
-            }
+        Label {
+            Text(appState.hotkeyConfig.displayName)
+                .font(.caption2)
+        } icon: {
+            Image(systemName: "keyboard")
+                .foregroundStyle(.secondary)
+        }
+
+        Button {
+            appState.openSettings()
         } label: {
-            Label("Hotkey: \(appState.hotkeyPreset.displayName)", systemImage: "keyboard")
+            Label("Hotkey Settings...", systemImage: "gearshape")
         }
 
         Button {
